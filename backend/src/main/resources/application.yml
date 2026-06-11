@@ -1,0 +1,26 @@
+spring:
+  application:
+    name: chrono-agent-backend
+  datasource:
+    url: jdbc:postgresql://localhost:5432/chrono_agent
+    username: chrono
+    password: chrono
+  jpa:
+    hibernate:
+      ddl-auto: validate
+    open-in-view: false
+  flyway:
+    enabled: true
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info
+
+chrono:
+  audio:
+    storage-root: ./audio-data
+    retention-days: 30
+  model-service:
+    base-url: http://localhost:8000

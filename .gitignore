@@ -1,0 +1,15 @@
+.idea/
+.vscode/
+target/
+*.class
+.mvn/wrapper/maven-wrapper.jar
+.venv/
+__pycache__/
+.pytest_cache/
+*.pyc
+*.egg-info/
+node_modules/
+.DS_Store
+audio-data/
+tmp/
+.env

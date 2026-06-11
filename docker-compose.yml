@@ -1,0 +1,20 @@
+services:
+  postgres:
+    image: postgres:16
+    container_name: chrono-agent-postgres
+    environment:
+      POSTGRES_DB: chrono_agent
+      POSTGRES_USER: chrono
+      POSTGRES_PASSWORD: chrono
+    ports:
+      - "5432:5432"
+    volumes:
+      - chrono-postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U chrono -d chrono_agent"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+volumes:
+  chrono-postgres-data:
