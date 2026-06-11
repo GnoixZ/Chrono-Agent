@@ -92,3 +92,42 @@ class AgentReplyResponse(BaseModel):
     content: str
     safety: SafetyResult
     memory_candidates: list[MemoryCandidate] = Field(default_factory=list)
+
+
+class VectorDocument(BaseModel):
+    document_id: str
+    user_id: str
+    source_type: str
+    source_id: str
+    content: str
+    reason: str = ""
+    created_at: str | None = None
+
+
+class VectorUpsertRequest(BaseModel):
+    request_id: str
+    documents: list[VectorDocument] = Field(default_factory=list)
+
+
+class VectorUpsertResponse(BaseModel):
+    indexed_count: int
+
+
+class VectorSearchRequest(BaseModel):
+    request_id: str
+    user_id: str
+    query: str
+    top_k: int = 8
+
+
+class VectorSearchResult(BaseModel):
+    document_id: str
+    source_type: str
+    source_id: str
+    content: str
+    reason: str
+    score: float
+
+
+class VectorSearchResponse(BaseModel):
+    items: list[VectorSearchResult] = Field(default_factory=list)

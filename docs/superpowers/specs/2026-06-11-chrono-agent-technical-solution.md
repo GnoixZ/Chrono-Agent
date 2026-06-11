@@ -31,8 +31,8 @@ Chrono Agent 保留这些产品和架构思想，但技术边界重新设计：
 
 - Omi 后端实现不迁移到本项目。
 - Java 后端负责产品状态、持久化、审计、Agent 编排和对外 API。
-- Python 服务负责语音、声纹、情绪、摘要、记忆候选和回复生成等模型能力。
-- PostgreSQL 作为 MVP 的主存储，向量检索和外部知识系统不进入第一期。
+- Python 服务负责语音、声纹、情绪、摘要、记忆候选、文本向量、向量召回和回复生成等模型能力。
+- PostgreSQL 作为 MVP 的主存储；阿里云 DashVector 作为 Agent 召回索引，不作为业务事实来源。
 
 ### 2.2 个人助手优先
 
@@ -113,12 +113,20 @@ flowchart TB
     Backend --> LocalStore["Local File Storage"]
     Backend --> Python["Python FastAPI Model Service"]
     Python --> ModelProviders["模型 Provider Adapter"]
+    Python --> OpenRouter["OpenRouter Nemotron"]
+    Python --> OpenRouterEmbedding["OpenRouter Embeddings"]
+    Python --> DashVector["Aliyun DashVector"]
 ```
 
 第一期本地开发可以使用：
 
 - Java 21 + Spring Boot。
+- Spring WebSocket 提供浏览器音频流 Demo。
+- `RestTemplate` + `fastjson2` 作为 Java 调 Python 的 HTTP JSON 边界。
 - Python 3.11+ + FastAPI。
+- OpenRouter chat completions 生成 Agent 回复，默认 `nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free`。
+- OpenRouter `nvidia/llama-nemotron-embed-vl-1b-v2:free` 生成文本向量。
+- 阿里云 DashVector 保存会话记录、长期记忆、健康事件和人物洞察的召回索引。
 - PostgreSQL + Flyway。
 - 本地文件系统作为音频对象存储抽象的默认实现。
 - Java 内置异步执行器或数据库任务表作为模型任务队列。
@@ -127,7 +135,8 @@ flowchart TB
 
 - 本地文件系统替换为对象存储。
 - Java 内置任务替换为 MQ 或工作流引擎。
-- Python fake provider 替换为真实 ASR、说话人分离、声纹和 LLM provider。
+- Python fake provider 替换为真实 ASR、说话人分离和声纹 provider。
+- OpenRouter chat、OpenRouter embedding 和 DashVector provider 通过 adapter 隔离，保留后续替换能力。
 
 ### 3.3 服务边界
 
@@ -161,6 +170,8 @@ Python 模型服务是模型能力适配层，尽量保持无状态。
 - 生活提醒候选和日程线索提取。
 - 个人记忆候选抽取。
 - Agent 回复生成。
+- 文本 embedding 生成。
+- DashVector 索引写入和相似召回查询。
 - 危机风险初筛。
 
 Python 服务不得直接写 PostgreSQL，也不得直接修改用户记忆和人物身份。所有持久化由 Java 后端完成。
@@ -177,7 +188,7 @@ PostgreSQL 保存结构化产品数据：
 - 个人记忆和召回审计。
 - 处理任务、错误和审计日志。
 
-MVP 不依赖独立向量数据库。需要相似检索时，先使用时间、类型、说话人、标签、关键词和 JSONB 字段过滤。`embedding_ref` 保留扩展点。
+Agent 召回使用阿里云 DashVector。PostgreSQL 仍保存完整业务数据和审计记录；DashVector 只保存召回索引文档，字段包括 `user_id`、`source_type`、`source_id`、`content`、`reason` 和 `created_at`。DashVector collection 维度必须与 `CHRONO_EMBEDDING_DIMENSION` 一致，当前默认 `2048`。
 
 ## 4. 模块设计
 
@@ -242,16 +253,26 @@ model-service/app
     fake.py
 ```
 
-MVP 可以先使用 deterministic fake provider，保证端到端链路稳定。真实模型接入时只替换 provider，不改变 Java 和 Python 之间的 API contract。
+音频分析和声纹能力可以先使用 deterministic fake provider，保证端到端链路稳定。Agent 回复使用 OpenRouter 上的 NVIDIA Nemotron 3 Nano Omni；如果 LLM 不可用，Python 返回 502，Java 不生成固定模板回复。真实 ASR、说话人分离和声纹模型接入时只替换 provider，不改变 Java 和 Python 之间的 API contract。
 
 ### 4.3 Java 与 Python 的接口边界
 
 Java 调 Python 采用 HTTP JSON API。Java 传入对象引用和上下文摘要，Python 返回结构化结果。
 
+当前实现约定：
+
+- `ModelServiceClient` 使用 Spring `RestTemplate` 发送请求。
+- 请求和响应 JSON 使用 `fastjson2` 序列化和反序列化。
+- Java DTO 通过 `@JSONField` 显式映射字段名。
+- Java/Python 模型接口字段名统一使用 snake_case，与 `model-service/app/schemas.py` 保持一致。
+- Spring MVC Demo API 面向前端时仍可以使用 Java 风格字段，例如 `userId`；模型服务边界必须使用 snake_case。
+
 核心接口：
 
 - `POST /v1/audio/analyze`
 - `POST /v1/agent/reply`
+- `POST /v1/vector/upsert`
+- `POST /v1/vector/search`
 - `POST /v1/memory/extract`
 - `POST /v1/safety/classify`
 
@@ -876,6 +897,37 @@ where status in ('pending', 'failed');
 | `POST` | `/api/speaker-label-suggestions/{suggestionId}/accept` | 接受标签建议 |
 | `POST` | `/api/speaker-label-suggestions/{suggestionId}/reject` | 拒绝标签建议 |
 
+### 6.6 本地 Demo API
+
+当前本地 Demo 直接由 Java 后端静态资源和 `/api/demo` 接口提供，用于演示完整闭环，不等同于最终生产 API。
+
+| 方法 | 路径 | 说明 |
+| --- | --- | --- |
+| `GET` | `/` | 打开 Chrono Agent Demo 工作台 |
+| `POST` | `/api/demo/audio` | 上传录音文件并同步跑完整分析链路 |
+| `GET` | `/api/demo/state?userId=` | 查询当前用户全部可展示数据 |
+| `POST` | `/api/demo/health` | 写入健康事件 |
+| `PATCH` | `/api/demo/speakers/{speakerClusterId}/label` | 用户标注匿名人物 |
+| `POST` | `/api/demo/memory-candidates/{candidateId}/accept` | 接受候选记忆并生成长期记忆 |
+| `POST` | `/api/demo/memory-candidates/{candidateId}/reject` | 拒绝候选记忆 |
+| `POST` | `/api/demo/agent/messages` | 发送 Agent 消息并持久化消息、run 和召回事件 |
+| `WS` | `/ws/audio?userId=` | 浏览器麦克风音频片段流 |
+
+`/api/demo/state` 会聚合并展示以下已存储数据：
+
+- 音频事件。
+- 健康事件。
+- 会话记录。
+- 说话人聚类和说话人片段。
+- 人物洞察。
+- 候选记忆和长期记忆。
+- Agent 会话、消息和 run。
+- 召回事件。
+- 模型任务。
+- 审计日志。
+
+PostgreSQL `jsonb` 字段在 Demo 状态接口中会转换为普通 JSON 数组或对象，避免前端暴露数据库驱动包装结构。
+
 ## 7. 关键业务流程
 
 ### 7.1 音频上传与后处理流程
@@ -1020,15 +1072,17 @@ sequenceDiagram
     participant M as Memory Service
     participant P as Python Model Service
     participant DB as PostgreSQL
+    participant V as DashVector
 
     U->>B: 发送消息
     B->>DB: 写 agent_message user
     B->>DB: 创建 agent_run
     B->>M: 构造短期上下文
     M->>DB: 查询最近消息
-    M->>DB: 召回会话记录
-    M->>DB: 召回个人记忆
-    M->>DB: 召回人物洞察和健康事件
+    M->>P: POST /v1/vector/search
+    P->>V: 按 user_id 过滤并相似召回
+    V-->>P: 会话记录、个人记忆、人物洞察和健康事件索引
+    P-->>M: 召回结果
     M->>DB: 写 memory_recall_event
     B->>P: POST /v1/agent/reply
     P-->>B: 回复、候选记忆、安全结果
@@ -1043,10 +1097,10 @@ sequenceDiagram
 
 - 当前会话最近若干条消息。
 - 当前用户意图和当前任务状态。
-- 最近 24 小时到 7 天内的相关会话记录。
-- 相关个人记忆。
-- 相关健康事件。
-- 相关人物洞察。
+- DashVector 召回的相关会话记录。
+- DashVector 召回的相关个人记忆。
+- DashVector 召回的相关健康事件。
+- DashVector 召回的相关人物洞察。
 - 安全策略和输出边界。
 
 短期上下文不作为独立业务记忆长期保存。为了审计和复现，系统只保存上下文快照引用或摘要引用到 `agent_run.short_term_memory_ref`。
@@ -1176,17 +1230,17 @@ Java 使用 `model_job` 管理异步任务。
 
 ```json
 {
-  "requestId": "8c411b22-0765-4e0c-94c1-3e64efafed14",
-  "userId": "user-1",
-  "audioEventId": "5c8f62f1-3b1e-4a8f-8c7e-1f2c2f2cf511",
-  "audioUri": "local://audio/user-1/2026/06/11/a.wav",
-  "startedAt": "2026-06-11T09:00:00Z",
-  "endedAt": "2026-06-11T09:05:00Z",
-  "knownSpeakers": [
+  "request_id": "8c411b22-0765-4e0c-94c1-3e64efafed14",
+  "user_id": "user-1",
+  "audio_event_id": "5c8f62f1-3b1e-4a8f-8c7e-1f2c2f2cf511",
+  "audio_uri": "local://audio/user-1/2026/06/11/a.wav",
+  "started_at": "2026-06-11T09:00:00Z",
+  "ended_at": "2026-06-11T09:05:00Z",
+  "known_speakers": [
     {
-      "speakerClusterId": "66e53c2f-8d64-4d37-9ff7-276202b4fa27",
-      "displayName": "Unknown Person 1",
-      "embeddingRefs": ["encrypted://speaker/66e53c2f/sample-1"]
+      "speaker_cluster_id": "66e53c2f-8d64-4d37-9ff7-276202b4fa27",
+      "display_name": "Unknown Person 1",
+      "embedding_refs": ["encrypted://speaker/66e53c2f/sample-1"]
     }
   ]
 }
@@ -1199,39 +1253,39 @@ Java 使用 `model_job` 管理异步任务。
   "language": "zh",
   "segments": [
     {
-      "speakerId": 1,
-      "startMs": 0,
-      "endMs": 4200,
+      "speaker_id": 1,
+      "start_ms": 0,
+      "end_ms": 4200,
       "transcript": "我今天有点累。",
       "confidence": 0.91,
-      "emotionTags": ["tired"],
-      "topicTags": ["work"]
+      "emotion_tags": ["tired"],
+      "topic_tags": ["work"]
     }
   ],
-  "speakerEmbeddings": [
+  "speaker_embeddings": [
     {
-      "speakerId": 1,
-      "embeddingRef": "encrypted://tmp/audio-event/speaker-1",
-      "qualityScore": 0.86
+      "speaker_id": 1,
+      "embedding_ref": "encrypted://tmp/audio-event/speaker-1",
+      "quality_score": 0.86
     }
   ],
   "summary": {
     "title": "上午状态记录",
     "overview": "用户提到今天疲惫，可能与工作压力有关。",
-    "topicTags": ["work", "energy"],
-    "emotionTags": ["tired"],
-    "suggestedActions": [
+    "topic_tags": ["work", "energy"],
+    "emotion_tags": ["tired"],
+    "suggested_actions": [
       {
         "type": "self_care",
         "text": "今天安排一个短休息窗口。"
       }
     ],
     "discard": false,
-    "discardReason": null
+    "discard_reason": null
   },
-  "memoryCandidates": [
+  "memory_candidates": [
     {
-      "memoryType": "life_pattern",
+      "memory_type": "life_pattern",
       "content": "用户在工作日上午容易感到疲惫。",
       "confidence": 0.62,
       "sensitivity": "normal"
@@ -1239,7 +1293,7 @@ Java 使用 `model_job` 管理异步任务。
   ],
   "safety": {
     "level": "normal",
-    "requiresCrisisResponse": false,
+    "requires_crisis_response": false,
     "reason": null
   }
 }
@@ -1282,17 +1336,17 @@ public interface MemoryService {
 
 1. 读取当前会话最近消息。
 2. 根据用户意图确定时间窗口。
-3. 查询相关 `conversation_memory`。
-4. 查询活跃 `memory_item`。
-5. 查询相关 `person_insight` 和 `speaker_cluster`。
-6. 查询相关健康事件。
+3. 调 Python `/v1/vector/search`，由 OpenRouter embeddings 生成 query embedding。
+4. DashVector 按 `user_id` 过滤后召回 `conversation_memory`、`memory_item`、`person_insight` 和 `health_event` 索引文档。
+5. 对召回结果做数量裁剪和敏感信息控制。
+6. 必要时回查 PostgreSQL 验证记录仍未删除或失效。
 7. 裁剪上下文，控制 token 和敏感信息。
 8. 写入召回审计。
 
 召回排序建议：
 
-- 用户显式提到的人物或时间优先。
-- 最近发生的会话记录优先。
+- DashVector 相似度分数优先。
+- 用户显式提到的人物或时间可作为过滤或重排信号。
 - 用户确认的记忆优先于模型建议记忆。
 - 有直接证据的记忆优先于抽象总结。
 - 安全备注只在安全场景进入上下文。

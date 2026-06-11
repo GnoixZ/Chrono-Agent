@@ -4,6 +4,10 @@ import ai.chrono.backend.modelclient.dto.AgentReplyRequest;
 import ai.chrono.backend.modelclient.dto.AgentReplyResponse;
 import ai.chrono.backend.modelclient.dto.AnalyzeAudioRequest;
 import ai.chrono.backend.modelclient.dto.AnalyzeAudioResponse;
+import ai.chrono.backend.modelclient.dto.VectorSearchRequest;
+import ai.chrono.backend.modelclient.dto.VectorSearchResponse;
+import ai.chrono.backend.modelclient.dto.VectorUpsertRequest;
+import ai.chrono.backend.modelclient.dto.VectorUpsertResponse;
 import com.alibaba.fastjson2.JSON;
 import com.alibaba.fastjson2.JSONException;
 import org.springframework.beans.factory.annotation.Value;
@@ -35,6 +39,16 @@ public class ModelServiceClient {
     public AgentReplyResponse generateReply(AgentReplyRequest request) {
         String response = postJson("/v1/agent/reply", request);
         return readJson(response, AgentReplyResponse.class);
+    }
+
+    public VectorUpsertResponse upsertVectors(VectorUpsertRequest request) {
+        String response = postJson("/v1/vector/upsert", request);
+        return readJson(response, VectorUpsertResponse.class);
+    }
+
+    public VectorSearchResponse searchVectors(VectorSearchRequest request) {
+        String response = postJson("/v1/vector/search", request);
+        return readJson(response, VectorSearchResponse.class);
     }
 
     private String postJson(String path, Object request) {

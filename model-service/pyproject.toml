@@ -5,7 +5,8 @@ requires-python = ">=3.11"
 dependencies = [
     "fastapi>=0.111.0",
     "uvicorn[standard]>=0.30.0",
-    "pydantic>=2.7.0"
+    "pydantic>=2.7.0",
+    "dashvector>=1.0.0"
 ]
 
 [project.optional-dependencies]

@@ -13,3 +13,5 @@ node_modules/
 audio-data/
 tmp/
 .env
+.env.local
+model-service/.env.local

@@ -4,9 +4,9 @@
 
 **目标：** 构建 Chrono Agent MVP：Java 后端负责产品状态、API、持久化、Agent 编排和审计；Python 模型服务负责音频、声纹、摘要、记忆候选、安全分类和回复生成；PostgreSQL 保存结构化数据。
 
-**架构：** 第一阶段采用 Java Spring Boot 单体后端 + Python FastAPI 模型服务 + PostgreSQL。Java 是唯一可信状态源，Python 尽量无状态，只返回模型分析结果和候选内容。MVP 不接外部数据源，不做真实硬件接入，不引入向量数据库。
+**架构：** 第一阶段采用 Java Spring Boot 单体后端 + Python FastAPI 模型服务 + PostgreSQL。Java 是唯一可信状态源，Python 尽量无状态，只返回模型分析结果、召回结果和候选内容。MVP 不接外部数据源，不做真实硬件接入；Agent 召回索引使用阿里云 DashVector，PostgreSQL 仍是主存储。
 
-**技术栈：** Java 21、Spring Boot、Maven、PostgreSQL、Flyway、Spring Data JPA、JUnit、Python 3.11+、FastAPI、Pydantic、pytest、Docker Compose。
+**技术栈：** Java 21、Spring Boot、Spring WebSocket、Maven、PostgreSQL、Flyway、Spring Data JPA、JUnit、`fastjson2`、Python 3.11+、FastAPI、Pydantic、pytest、Docker Compose。
 
 ---
 
@@ -30,13 +30,15 @@
 
 需要新增的依赖：
 
-- Java 后端：Spring Boot Web、Validation、Data JPA、Actuator、Flyway、PostgreSQL Driver、H2 Test Database。
+- Java 后端：Spring Boot Web、Spring WebSocket、Validation、Data JPA、Actuator、Flyway、PostgreSQL Driver、H2 Test Database、`fastjson2`。
 - Python 模型服务：FastAPI、Uvicorn、Pydantic、pytest、httpx。
 - 本地开发：Docker Compose PostgreSQL。
 
 收益：
 
 - Spring Boot 快速建立 Java HTTP API、参数校验、持久化、健康检查和测试框架。
+- Spring WebSocket 支持浏览器麦克风音频片段流 Demo。
+- `fastjson2` 固化 Java/Python JSON 字段映射，避免依赖 Spring MVC 消息转换器调用 Python 模型服务。
 - FastAPI 适合承载 Python 模型服务，Pydantic 可以保证 Java/Python 间 schema 稳定。
 - PostgreSQL 与当前领域模型匹配，支持 JSONB、索引、事务和后续扩展。
 - Flyway 保证数据库 schema 可追踪、可迁移。
@@ -84,6 +86,7 @@ I:\Chrono Agent
                 ChronoBackendApplication.java
                 common
                 user
+                demo
                 audio
                 health
                 modelclient
@@ -95,7 +98,12 @@ I:\Chrono Agent
                 timeline
                 safety
                 audit
+                websocket
         resources
+          static
+            index.html
+            app.js
+            styles.css
           application.yml
           db
             migration
@@ -130,6 +138,7 @@ I:\Chrono Agent
 模块边界：
 
 - `backend/common`：通用异常、响应、日志脱敏、时间和 ID。
+- `backend/demo`：本地浏览器 Demo API、状态聚合和端到端演示 pipeline。
 - `backend/audio`：音频上传、流式会话、音频对象引用和音频事件。
 - `backend/health`：健康事件写入和查询。
 - `backend/task`：模型任务、状态机、重试和幂等。
@@ -140,7 +149,9 @@ I:\Chrono Agent
 - `backend/agent`：Agent 会话、消息、Agent run、回复编排。
 - `backend/safety`：危机风险、输出限制、敏感内容规则。
 - `backend/audit`：敏感数据操作审计。
-- `model-service/providers`：模型 provider adapter，MVP 先用 fake provider。
+- `backend/websocket`：Spring WebSocket 音频片段流入口 `/ws/audio`。
+- `backend/src/main/resources/static`：Chrono Agent Demo 工作台。
+- `model-service/providers`：模型 provider adapter；音频分析 MVP 先用 fake provider，Agent 回复使用 OpenRouter，召回索引使用 OpenRouter embeddings + DashVector。
 - `model-service/services`：组合 provider 的业务服务。
 
 ## 3. 执行规则
@@ -149,6 +160,9 @@ I:\Chrono Agent
 - 当前目录不是 git 仓库，不执行 commit。
 - 如果后续用户明确初始化 git 并批准提交，每个 Task 的检查点只允许添加本 Task 涉及文件，不能使用 `git add .`。
 - Java/Python 之间的字段名以 `model-service/app/schemas.py` 和 `backend/modelclient/dto` 为准。
+- Java/Python 模型服务 HTTP JSON 边界使用 `RestTemplate` + `fastjson2`，字段名保持 snake_case。
+- 本地 Demo API 面向浏览器时可以保留 Java 风格字段，例如 `userId`；模型服务边界不得混用 camelCase。
+- WebSocket 音频流使用 Spring WebSocket 注册 `/ws/audio`。
 - Python 不直接访问 PostgreSQL。
 - Java 不在日志中输出完整转写、心理状态原文、声纹向量或完整 prompt。
 - 所有用户数据查询必须带 `user_id` 过滤。
@@ -666,21 +680,22 @@ def generate_reply(request: AgentReplyRequest) -> AgentReplyResponse:
 ```java
 package ai.chrono.backend.modelclient.dto;
 
+import com.alibaba.fastjson2.annotation.JSONField;
 import java.util.List;
 
 public record AnalyzeAudioRequest(
-        String requestId,
-        String userId,
-        String audioEventId,
-        String audioUri,
-        String startedAt,
-        String endedAt,
-        List<KnownSpeakerDto> knownSpeakers
+        @JSONField(name = "request_id") String requestId,
+        @JSONField(name = "user_id") String userId,
+        @JSONField(name = "audio_event_id") String audioEventId,
+        @JSONField(name = "audio_uri") String audioUri,
+        @JSONField(name = "started_at") String startedAt,
+        @JSONField(name = "ended_at") String endedAt,
+        @JSONField(name = "known_speakers") List<KnownSpeakerDto> knownSpeakers
 ) {
     public record KnownSpeakerDto(
-            String speakerClusterId,
-            String displayName,
-            List<String> embeddingRefs
+            @JSONField(name = "speaker_cluster_id") String speakerClusterId,
+            @JSONField(name = "display_name") String displayName,
+            @JSONField(name = "embedding_refs") List<String> embeddingRefs
     ) {
     }
 }
@@ -691,32 +706,33 @@ public record AnalyzeAudioRequest(
 ```java
 package ai.chrono.backend.modelclient.dto;
 
+import com.alibaba.fastjson2.annotation.JSONField;
 import java.util.List;
 import java.util.Map;
 
 public record AnalyzeAudioResponse(
         String language,
         List<SpeakerSegmentDto> segments,
-        List<SpeakerEmbeddingDto> speakerEmbeddings,
+        @JSONField(name = "speaker_embeddings") List<SpeakerEmbeddingDto> speakerEmbeddings,
         ConversationSummaryDto summary,
-        List<MemoryCandidateDto> memoryCandidates,
+        @JSONField(name = "memory_candidates") List<MemoryCandidateDto> memoryCandidates,
         SafetyResultDto safety
 ) {
     public record SpeakerSegmentDto(
-            Integer speakerId,
-            Integer startMs,
-            Integer endMs,
+            @JSONField(name = "speaker_id") Integer speakerId,
+            @JSONField(name = "start_ms") Integer startMs,
+            @JSONField(name = "end_ms") Integer endMs,
             String transcript,
             Double confidence,
-            List<String> emotionTags,
-            List<String> topicTags
+            @JSONField(name = "emotion_tags") List<String> emotionTags,
+            @JSONField(name = "topic_tags") List<String> topicTags
     ) {
     }
 
     public record SpeakerEmbeddingDto(
-            Integer speakerId,
-            String embeddingRef,
-            Double qualityScore
+            @JSONField(name = "speaker_id") Integer speakerId,
+            @JSONField(name = "embedding_ref") String embeddingRef,
+            @JSONField(name = "quality_score") Double qualityScore
     ) {
     }
 
@@ -729,17 +745,17 @@ public record AnalyzeAudioResponse(
     public record ConversationSummaryDto(
             String title,
             String overview,
-            List<String> topicTags,
-            List<String> emotionTags,
-            List<SuggestedActionDto> suggestedActions,
-            List<Map<String, Object>> suggestedEvents,
+            @JSONField(name = "topic_tags") List<String> topicTags,
+            @JSONField(name = "emotion_tags") List<String> emotionTags,
+            @JSONField(name = "suggested_actions") List<SuggestedActionDto> suggestedActions,
+            @JSONField(name = "suggested_events") List<Map<String, Object>> suggestedEvents,
             Boolean discard,
-            String discardReason
+            @JSONField(name = "discard_reason") String discardReason
     ) {
     }
 
     public record MemoryCandidateDto(
-            String memoryType,
+            @JSONField(name = "memory_type") String memoryType,
             String content,
             Double confidence,
             String sensitivity
@@ -748,7 +764,7 @@ public record AnalyzeAudioResponse(
 
     public record SafetyResultDto(
             String level,
-            Boolean requiresCrisisResponse,
+            @JSONField(name = "requires_crisis_response") Boolean requiresCrisisResponse,
             String reason
     ) {
     }
@@ -760,19 +776,20 @@ public record AnalyzeAudioResponse(
 ```java
 package ai.chrono.backend.modelclient.dto;
 
+import com.alibaba.fastjson2.annotation.JSONField;
 import java.util.List;
 
 public record AgentReplyRequest(
-        String requestId,
-        String userId,
-        String conversationSessionId,
-        String messageId,
-        String userMessage,
-        List<AgentContextItemDto> contextItems
+        @JSONField(name = "request_id") String requestId,
+        @JSONField(name = "user_id") String userId,
+        @JSONField(name = "conversation_session_id") String conversationSessionId,
+        @JSONField(name = "message_id") String messageId,
+        @JSONField(name = "user_message") String userMessage,
+        @JSONField(name = "context_items") List<AgentContextItemDto> contextItems
 ) {
     public record AgentContextItemDto(
-            String sourceType,
-            String sourceId,
+            @JSONField(name = "source_type") String sourceType,
+            @JSONField(name = "source_id") String sourceId,
             String content,
             String reason,
             Double score
@@ -786,12 +803,13 @@ public record AgentReplyRequest(
 ```java
 package ai.chrono.backend.modelclient.dto;
 
+import com.alibaba.fastjson2.annotation.JSONField;
 import java.util.List;
 
 public record AgentReplyResponse(
         String content,
         AnalyzeAudioResponse.SafetyResultDto safety,
-        List<AnalyzeAudioResponse.MemoryCandidateDto> memoryCandidates
+        @JSONField(name = "memory_candidates") List<AnalyzeAudioResponse.MemoryCandidateDto> memoryCandidates
 ) {
 }
 ```
@@ -2566,12 +2584,143 @@ Write-Host "MVP verification completed."
 该脚本会启动 PostgreSQL，运行 Java 后端测试和 Python 模型服务测试。
 ````
 
+---
+
+## Task 15：本地全流程 Demo 增量实现
+
+**Status:** 已落地。
+
+**Files:**
+
+- Create/Modify: `backend/src/main/resources/static/index.html`
+- Create/Modify: `backend/src/main/resources/static/styles.css`
+- Create/Modify: `backend/src/main/resources/static/app.js`
+- Create/Modify: `backend/src/main/java/ai/chrono/backend/demo/*`
+- Create/Modify: `backend/src/main/java/ai/chrono/backend/websocket/*`
+- Modify: `backend/src/main/java/ai/chrono/backend/modelclient/*`
+- Modify: `backend/pom.xml`
+- Modify: `README.md`
+- Create/Modify: `docs/superpowers/specs/2026-06-11-chrono-agent-demo-flow-design.md`
+
+- [x] **Step 1：实现本地 Demo 工作台**
+
+工作台入口：
+
+```text
+http://localhost:8080/
+```
+
+页面需要支持：
+
+- 选择或输入 `userId`。
+- 上传录音文件。
+- 使用浏览器麦克风录音后上传。
+- 使用 WebSocket 实时发送音频片段。
+- 录入健康事件。
+- 展示时间线、会话摘要和转写片段。
+- 展示周围人物、用户标注、候选记忆和长期记忆。
+- 展示 Agent 对话和本轮召回上下文。
+- 展示已落库的音频、健康、会话、人物、转写、洞察、候选记忆、长期记忆、Agent 会话、消息、run、召回、模型任务和审计日志。
+
+- [x] **Step 2：实现 Demo Pipeline**
+
+`DemoPipelineService` 负责把演示操作写入真实数据库表，而不是只展示静态假数据。
+
+音频上传或 WebSocket stop 后写入：
+
+- `audio_event`
+- `model_job`
+- `speaker_cluster`
+- `speaker_segment`
+- `speaker_embedding`
+- `conversation_memory`
+- `memory_write_candidate`
+- `person_insight`
+- `audit_log`
+
+Agent 对话写入：
+
+- `conversation_session`
+- `agent_message`
+- `agent_run`
+- `memory_recall_event`
+- `memory_write_candidate`
+
+召回索引写入：
+
+- `conversation_memory` 写入后尝试 upsert 到 DashVector。
+- `memory_item` 写入后尝试 upsert 到 DashVector。
+- `health_event` 写入后尝试 upsert 到 DashVector。
+- `person_insight` 写入后尝试 upsert 到 DashVector。
+- 索引失败写 `audit_log`，不回滚 PostgreSQL 主数据。
+
+- [x] **Step 3：实现 Spring WebSocket 音频流**
+
+实现约定：
+
+- 使用 Spring WebSocket `WebSocketConfigurer` 注册 `/ws/audio`。
+- 使用 `AudioStreamWebSocketHandler` 接收二进制音频片段和 `stop` 控制消息。
+- WebSocket 建连时创建 `audio_stream_session`。
+- 收到音频片段后更新 `last_active_at`。
+- 收到 `stop` 后合并片段，复用 `DemoPipelineService.processAudio(...)`。
+- 处理完成后返回 `processing_completed`，并把 `audio_event.stream_session_id` 关联到本次流式会话。
+
+服务端消息类型：
+
+- `stream_opened`
+- `chunk_received`
+- `processing_started`
+- `processing_completed`
+- `error`
+
+- [x] **Step 4：模型服务调用改为 RestTemplate + fastjson2**
+
+实现约定：
+
+- `ModelServiceClient` 使用 `RestTemplate.exchange(...)` 调 Python FastAPI。
+- 请求体使用 `fastjson2` 序列化为 JSON 字符串。
+- 响应体使用 `fastjson2` 反序列化为 Java record。
+- Java DTO 使用 `@JSONField` 映射 snake_case 字段。
+- 不依赖 `spring-boot-starter-json` 作为 Java 调 Python 的消息转换器。
+- Agent 回复调用 Python `/v1/agent/reply`，由 OpenRouter NVIDIA Nemotron 3 Nano Omni 生成。
+- Agent 召回调用 Python `/v1/vector/search`，由 OpenRouter embeddings + DashVector 返回上下文。
+- 如果 OpenRouter 或 DashVector 不可用，本轮 Agent 对话返回失败，不生成固定模板助手回复。
+
+- [x] **Step 5：补齐 Demo 展示细节**
+
+实现约定：
+
+- `/api/demo/state` 聚合所有演示需要的数据。
+- PostgreSQL `jsonb` 字段返回前转换成普通 JSON 数组或对象。
+- 浏览器麦克风录音前检查 `navigator.mediaDevices.getUserMedia`。
+- 非安全上下文或局域网 HTTP 访问导致麦克风不可用时，前端展示明确提示。
+
+- [x] **Step 6：验证**
+
+验证命令：
+
+```powershell
+.\scripts\verify-mvp.ps1
+```
+
+额外手动验证：
+
+- `POST /api/demo/audio` 可以上传录音并生成会话记录。
+- `POST /api/demo/health` 可以写入健康事件。
+- `PATCH /api/demo/speakers/{speakerClusterId}/label` 可以标注匿名人物。
+- `POST /api/demo/memory-candidates/{candidateId}/accept` 可以生成长期记忆。
+- 配置 OpenRouter 和 DashVector 后，`POST /api/demo/agent/messages` 可以生成 Agent 回复、消息、run 和召回事件。
+- `WS /ws/audio?userId=` 可以完成 `stream_opened`、`chunk_received`、`processing_started`、`processing_completed`。
+- 浏览器打开 `http://localhost:8080/` 后可以展示全流程和已存储用户数据。
+
 ## 4. 验收清单
 
 - [ ] 可以上传音频并生成 `audio_event`。
 - [ ] 可以创建 `audio_stream_session` 并限制单用户单活跃流。
 - [ ] 可以创建 `model_job` 并追踪任务状态。
-- [ ] Python fake 模型服务可以返回转写、说话人片段、声纹样本引用、摘要、候选记忆和安全结果。
+- [ ] Python fake 音频模型服务可以返回转写、说话人片段、声纹样本引用、摘要、候选记忆和安全结果。
+- [ ] Agent 回复使用 OpenRouter NVIDIA Nemotron 3 Nano Omni，LLM 不可用时返回失败。
+- [ ] Agent 召回使用 OpenRouter embeddings + 阿里云 DashVector，DashVector 不可用时本轮对话返回失败。
 - [ ] Java 可以保存 `conversation_memory`，并对低价值音频设置 `discarded`。
 - [ ] 可以写入健康事件，并在时间线和 Agent 上下文中被引用。
 - [ ] 可以创建 Agent 会话、用户消息、助手消息和 Agent run。
@@ -2584,6 +2733,11 @@ Write-Host "MVP verification completed."
 - [ ] 可以生成人物洞察，并避免真实身份和敏感属性推断。
 - [ ] 可以记录敏感操作审计日志。
 - [ ] 日志不会输出完整转写、声纹向量、完整 prompt 或完整心理状态描述。
+- [ ] 本地 Demo 可以上传录音文件并展示处理结果。
+- [ ] 本地 Demo 可以使用浏览器麦克风录音后上传。
+- [ ] 本地 Demo 可以通过 `/ws/audio` 演示 WebSocket 音频片段流。
+- [ ] 本地 Demo 可以展示已存储用户数据，而不是静态假数据。
+- [ ] Java 调 Python 模型服务使用 `RestTemplate` + `fastjson2`，并保持 snake_case JSON 合约。
 
 ## 5. 自检结果
 
@@ -2599,13 +2753,14 @@ Write-Host "MVP verification completed."
 - 声纹识别、未注册人物分析和用户标注：Task 12。
 - 安全、隐私、审计和删除策略基础：Task 13。
 - 端到端验证：Task 14。
+- 本地浏览器 Demo、Spring WebSocket、已存储用户数据展示和 `RestTemplate` + `fastjson2` 模型调用：Task 15。
 
 明确不进入 MVP：
 
 - 外部数据接入。
 - 插件市场。
 - 独立任务系统。
-- 独立向量数据库。
+- 自建或本地部署独立向量数据库；当前召回索引使用阿里云 DashVector。
 - 跨账号声纹匹配。
 - 医疗诊断和心理治疗。
 
@@ -2617,3 +2772,5 @@ Write-Host "MVP verification completed."
 2. **Inline Execution**：在当前线程按 Task 顺序实现，适合持续讨论和随时调整。
 
 请选择执行方式。
+
+当前项目已按 Task 15 补齐本地演示层。后续继续执行计划时，应以现有代码为准，不要回退 WebSocket、模型调用和 Demo 数据展示实现。

@@ -8,8 +8,13 @@ import ai.chrono.backend.modelclient.dto.AgentReplyRequest;
 import ai.chrono.backend.modelclient.dto.AgentReplyResponse;
 import ai.chrono.backend.modelclient.dto.AnalyzeAudioRequest;
 import ai.chrono.backend.modelclient.dto.AnalyzeAudioResponse;
+import ai.chrono.backend.modelclient.dto.VectorDocumentDto;
+import ai.chrono.backend.modelclient.dto.VectorSearchRequest;
+import ai.chrono.backend.modelclient.dto.VectorSearchResponse;
+import ai.chrono.backend.modelclient.dto.VectorUpsertRequest;
 import ai.chrono.backend.speaker.PersonInsightService;
 import ai.chrono.backend.speaker.SpeakerLabelSuggestionService;
+import ai.chrono.backend.task.ModelJobService;
 import com.alibaba.fastjson2.JSON;
 import com.alibaba.fastjson2.JSONException;
 import org.springframework.jdbc.core.JdbcTemplate;
@@ -34,9 +39,25 @@ import java.util.UUID;
 public class DemoPipelineService {
     private static final String JSONB = "cast(? as jsonb)";
 
+    public record AudioWindowMetadata(
+            Integer windowIndex,
+            Instant windowStartedAt,
+            Instant windowEndedAt,
+            boolean finalWindow
+    ) {
+    }
+
+    public record PendingAudioAnalysis(
+            String audioEventId,
+            String modelJobId,
+            String processingStatus
+    ) {
+    }
+
     private final JdbcTemplate jdbc;
     private final AudioStorage audioStorage;
     private final ModelServiceClient modelServiceClient;
+    private final ModelJobService modelJobService;
     private final MemoryCandidateDecisionService memoryDecisionService;
     private final SpeakerLabelSuggestionService labelSuggestionService;
     private final PersonInsightService personInsightService;
@@ -45,6 +66,7 @@ public class DemoPipelineService {
             JdbcTemplate jdbc,
             AudioStorage audioStorage,
             ModelServiceClient modelServiceClient,
+            ModelJobService modelJobService,
             MemoryCandidateDecisionService memoryDecisionService,
             SpeakerLabelSuggestionService labelSuggestionService,
             PersonInsightService personInsightService
@@ -52,6 +74,7 @@ public class DemoPipelineService {
         this.jdbc = jdbc;
         this.audioStorage = audioStorage;
         this.modelServiceClient = modelServiceClient;
+        this.modelJobService = modelJobService;
         this.memoryDecisionService = memoryDecisionService;
         this.labelSuggestionService = labelSuggestionService;
         this.personInsightService = personInsightService;
@@ -59,20 +82,39 @@ public class DemoPipelineService {
 
     @Transactional
     public DemoAudioResult processAudio(String userId, String fileName, byte[] bytes, String sourceType, UUID streamSessionId) {
+        return processAudio(userId, fileName, bytes, sourceType, streamSessionId, null);
+    }
+
+    @Transactional
+    public DemoAudioResult processAudio(String userId, String fileName, byte[] bytes, String sourceType, UUID streamSessionId, AudioWindowMetadata windowMetadata) {
+        PendingAudioAnalysis pendingAudioAnalysis = enqueueAudioAnalysis(userId, fileName, bytes, sourceType, streamSessionId, windowMetadata);
+        return processPendingAudio(UUID.fromString(pendingAudioAnalysis.audioEventId()));
+    }
+
+    @Transactional
+    public PendingAudioAnalysis enqueueAudioAnalysis(String userId, String fileName, byte[] bytes, String sourceType, UUID streamSessionId, AudioWindowMetadata windowMetadata) {
         Instant now = Instant.now();
         AudioStorage.StoredAudio storedAudio = audioStorage.save(new AudioStorage.AudioInput(userId, safeFileName(fileName), bytes));
         UUID audioEventId = UUID.randomUUID();
-        UUID modelJobId = UUID.randomUUID();
-        String idempotencyKey = "audio_analyze:" + audioEventId;
+        ModelJobService.ModelJobDraft modelJobDraft = modelJobService.createAudioAnalyzeJob(userId, audioEventId);
 
         jdbc.update("""
                         insert into audio_event (
                             id, user_id, source_type, started_at, ended_at, audio_uri, processing_status,
-                            stream_session_id, sample_rate, codec, duration_ms, retention_expires_at, created_at, updated_at
-                        ) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                            stream_session_id, sample_rate, codec, duration_ms, retention_expires_at,
+                            window_index, window_started_at, window_ended_at, is_final_window,
+                            created_at, updated_at
+                        ) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                         """,
-                audioEventId, userId, sourceType, Timestamp.from(now), Timestamp.from(now), storedAudio.audioUri(), "processing",
+                audioEventId, userId, sourceType,
+                windowTimestamp(windowMetadata == null ? null : windowMetadata.windowStartedAt(), now),
+                windowTimestamp(windowMetadata == null ? null : windowMetadata.windowEndedAt(), now),
+                storedAudio.audioUri(), "processing",
                 streamSessionId, 16000, fileNameCodec(fileName), null, Timestamp.from(now.plus(30, ChronoUnit.DAYS)),
+                windowMetadata == null ? null : windowMetadata.windowIndex(),
+                windowTimestamp(windowMetadata == null ? null : windowMetadata.windowStartedAt(), null),
+                windowTimestamp(windowMetadata == null ? null : windowMetadata.windowEndedAt(), null),
+                windowMetadata != null && windowMetadata.finalWindow(),
                 Timestamp.from(now), Timestamp.from(now));
 
         jdbc.update("""
@@ -81,8 +123,38 @@ public class DemoPipelineService {
                             request_ref, response_ref, idempotency_key, created_at, updated_at
                         ) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                         """,
-                modelJobId, userId, "audio_analyze", "audio_event", audioEventId, "running", 1, Timestamp.from(now),
-                "audio://" + audioEventId, null, idempotencyKey, Timestamp.from(now), Timestamp.from(now));
+                modelJobDraft.id(), modelJobDraft.userId(), modelJobDraft.jobType(), modelJobDraft.sourceRefType(), modelJobDraft.sourceRefId(),
+                modelJobDraft.status(), modelJobDraft.attempts(), Timestamp.from(modelJobDraft.nextRunAt()),
+                "audio://" + audioEventId, null, modelJobDraft.idempotencyKey(), Timestamp.from(now), Timestamp.from(now));
+
+        return new PendingAudioAnalysis(audioEventId.toString(), modelJobDraft.id().toString(), "processing");
+    }
+
+    @Transactional
+    public DemoAudioResult processPendingAudio(UUID audioEventId) {
+        Map<String, Object> audioEvent = jdbc.queryForMap("""
+                select user_id, audio_uri, started_at, ended_at
+                from audio_event
+                where id = ?
+                """, audioEventId);
+        String userId = String.valueOf(audioEvent.get("user_id"));
+        String audioUri = String.valueOf(audioEvent.get("audio_uri"));
+        Instant startedAt = timestampValue(audioEvent.get("started_at"), Instant.now());
+        Instant endedAt = timestampValue(audioEvent.get("ended_at"), startedAt);
+        UUID modelJobId = jdbc.queryForObject("""
+                select id
+                from model_job
+                where source_ref_type = ? and source_ref_id = ?
+                order by created_at desc
+                limit 1
+                """, UUID.class, "audio_event", audioEventId);
+
+        jdbc.update("""
+                        update model_job
+                        set status = ?, attempts = attempts + 1, next_run_at = ?, updated_at = ?
+                        where id = ?
+                        """,
+                "running", Timestamp.from(Instant.now()), Timestamp.from(Instant.now()), modelJobId);
 
         AnalyzeAudioResponse response;
         try {
@@ -90,9 +162,9 @@ public class DemoPipelineService {
                     UUID.randomUUID().toString(),
                     userId,
                     audioEventId.toString(),
-                    storedAudio.audioUri(),
-                    now.toString(),
-                    now.toString(),
+                    audioUri,
+                    startedAt.toString(),
+                    endedAt.toString(),
                     List.of()
             ));
         } catch (RuntimeException error) {
@@ -109,6 +181,7 @@ public class DemoPipelineService {
         boolean discarded = Boolean.TRUE.equals(response.summary().discard());
         String processingStatus = discarded ? "discarded" : "completed";
         UUID conversationMemoryId = UUID.randomUUID();
+        Instant now = Instant.now();
         List<Map<String, Object>> speakerRefs = persistSpeakerData(userId, audioEventId, response, now);
 
         jdbc.update("""
@@ -119,7 +192,7 @@ public class DemoPipelineService {
                             suggested_actions, suggested_events, created_at, updated_at
                         ) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, %s, %s, %s, %s, %s, %s, ?, ?)
                         """.formatted(JSONB, JSONB, JSONB, JSONB, JSONB, JSONB),
-                conversationMemoryId, userId, "audio", audioEventId, Timestamp.from(now), Timestamp.from(now),
+                conversationMemoryId, userId, "audio", audioEventId, Timestamp.from(startedAt), Timestamp.from(endedAt),
                 response.summary().title(), response.summary().overview(), response.language(), "life_log",
                 processingStatus, "completed", 1, discarded, response.summary().discardReason(), "private",
                 "inline://speaker-segments/" + audioEventId,
@@ -129,6 +202,14 @@ public class DemoPipelineService {
 
         persistMemoryCandidates(response.memoryCandidates(), null, conversationMemoryId, null, "model_suggested");
         persistPersonInsights(userId, speakerRefs, now);
+        tryIndexVectorDocument(
+                userId,
+                "conversation_memory",
+                conversationMemoryId,
+                response.summary().title() + "\n" + response.summary().overview(),
+                "录音分析形成的会话记录",
+                now
+        );
 
         jdbc.update("update model_job set status = ?, response_ref = ?, updated_at = ? where id = ?",
                 "completed", "conversation_memory://" + conversationMemoryId, Timestamp.from(Instant.now()), modelJobId);
@@ -153,7 +234,20 @@ public class DemoPipelineService {
     public DemoStateResponse getState(String userId) {
         return new DemoStateResponse(
                 userId,
-                rows("select id, source_type, started_at, ended_at, audio_uri, processing_status, stream_session_id, created_at from audio_event where user_id = ? order by created_at desc limit 20", userId),
+                rows("""
+                        select id, source_type, started_at, ended_at, audio_uri, processing_status, stream_session_id,
+                               window_index, window_started_at, window_ended_at, is_final_window, created_at
+                        from audio_event
+                        where user_id = ?
+                        order by created_at desc limit 20
+                        """, userId),
+                rows("""
+                        select id, source_type, status, started_at, last_active_at, closed_at, close_reason,
+                               current_audio_event_id, window_count, processed_window_count, failed_window_count, created_at, updated_at
+                        from audio_stream_session
+                        where user_id = ?
+                        order by created_at desc limit 20
+                        """, userId),
                 rows("select id, event_type, measured_at, value_numeric, value_text, unit, source, created_at from health_event where user_id = ? order by measured_at desc limit 30", userId),
                 rows("select id, source_type, source_audio_event_id, started_at, title, overview, status, discarded, discard_reason, topic_tags, emotion_tags, created_at from conversation_memory where user_id = ? and deleted_at is null order by created_at desc limit 20", userId),
                 rows("select id, display_name, status, user_labeled, label_suggestion, first_seen_at, last_seen_at, match_confidence_summary from speaker_cluster where user_id = ? and deleted_at is null order by last_seen_at desc limit 20", userId),
@@ -269,6 +363,14 @@ public class DemoPipelineService {
                 json(List.of(Map.of("type", "memory_write_candidate", "id", candidateId.toString()))),
                 Timestamp.from(now), Timestamp.from(now), Timestamp.from(now));
         jdbc.update("update memory_write_candidate set decision = ?, decided_at = ? where id = ?", "accepted", Timestamp.from(now), candidateId);
+        tryIndexVectorDocument(
+                userId,
+                "memory_item",
+                memoryId,
+                String.valueOf(candidate.get("content")),
+                "用户确认的长期个人记忆",
+                now
+        );
         audit(userId, "memory.accept", "memory_item", memoryId, Map.of("candidateId", candidateId.toString()));
         return row("select id, memory_type, content, confidence, source, evidence_refs, created_at from memory_item where id = ?", memoryId);
     }
@@ -303,7 +405,7 @@ public class DemoPipelineService {
                 runId, sessionId, userMessageId, "running", Timestamp.from(now.minus(7, ChronoUnit.DAYS)), Timestamp.from(now),
                 json(Map.of("level", "normal")), Timestamp.from(now));
 
-        List<Map<String, Object>> recalled = recallContext(request.userId());
+        List<Map<String, Object>> recalled = recallContext(request.userId(), request.content());
         persistRecallEvents(runId, recalled);
         AgentReplyResponse reply = modelServiceClient.generateReply(new AgentReplyRequest(
                 UUID.randomUUID().toString(),
@@ -447,14 +549,16 @@ public class DemoPipelineService {
             Map<String, Object> speaker = row("select display_name from speaker_cluster where id = ?", clusterId);
             String displayName = String.valueOf(speaker.getOrDefault("displayName", "这个人"));
             String summary = personInsightService.summarizeInteraction(displayName, 1);
+            UUID insightId = UUID.randomUUID();
             jdbc.update("""
                             insert into person_insight (
                                 id, user_id, speaker_cluster_id, insight_type, time_window_start, time_window_end,
                                 summary, evidence_refs, confidence, safety_level, created_at
                             ) values (?, ?, ?, ?, ?, ?, ?, %s, ?, ?, ?)
                             """.formatted(JSONB),
-                    UUID.randomUUID(), userId, clusterId, "interaction_summary", Timestamp.from(now.minus(1, ChronoUnit.HOURS)),
+                    insightId, userId, clusterId, "interaction_summary", Timestamp.from(now.minus(1, ChronoUnit.HOURS)),
                     Timestamp.from(now), summary, json(speakerRefs), 0.66, "normal", Timestamp.from(now));
+            tryIndexVectorDocument(userId, "person_insight", insightId, summary, "周围人物互动洞察", now);
         }
     }
 
@@ -478,24 +582,23 @@ public class DemoPipelineService {
         }
     }
 
-    private List<Map<String, Object>> recallContext(String userId) {
-        List<Map<String, Object>> recalled = new ArrayList<>();
-        rows("select id, title, overview, created_at from conversation_memory where user_id = ? and discarded = false and deleted_at is null order by created_at desc limit 3", userId)
-                .forEach(row -> recalled.add(contextItem("conversation_memory", row.get("id"), row.get("overview"), "最近会话记录", 0.92)));
-        rows("select id, content, memory_type, created_at from memory_item where user_id = ? and invalid_at is null and deleted_at is null order by created_at desc limit 3", userId)
-                .forEach(row -> recalled.add(contextItem("memory_item", row.get("id"), row.get("content"), "长期个人记忆", 0.88)));
-        rows("select id, event_type, value_numeric, value_text, unit, measured_at from health_event where user_id = ? order by measured_at desc limit 3", userId)
-                .forEach(row -> recalled.add(contextItem("health_event", row.get("id"), healthText(row), "最近健康事件", 0.72)));
-        rows("select id, summary, speaker_cluster_id, created_at from person_insight where user_id = ? order by created_at desc limit 3", userId)
-                .forEach(row -> recalled.add(contextItem("person_insight", row.get("id"), row.get("summary"), "周围人物洞察", 0.7)));
-        return recalled;
+    private List<Map<String, Object>> recallContext(String userId, String query) {
+        VectorSearchResponse response = modelServiceClient.searchVectors(new VectorSearchRequest(
+                UUID.randomUUID().toString(),
+                userId,
+                query,
+                8
+        ));
+        return nullSafe(response.items()).stream()
+                .map(item -> contextItem(item.sourceType(), item.sourceId(), item.content(), item.reason(), number(item.score(), 0.5)))
+                .toList();
     }
 
     private void persistRecallEvents(UUID runId, List<Map<String, Object>> recalled) {
         int rank = 1;
         for (Map<String, Object> item : recalled) {
             String sourceType = String.valueOf(item.get("sourceType"));
-            UUID sourceId = UUID.fromString(String.valueOf(item.get("sourceId")));
+            UUID sourceId = parseUuid(String.valueOf(item.get("sourceId")));
             UUID memoryItemId = "memory_item".equals(sourceType) ? sourceId : null;
             UUID conversationMemoryId = "conversation_memory".equals(sourceType) ? sourceId : null;
             jdbc.update("""
@@ -506,6 +609,28 @@ public class DemoPipelineService {
                     UUID.randomUUID(), runId, sourceType, memoryItemId, conversationMemoryId, rank,
                     String.valueOf(item.get("reason")), number(item.get("score"), 0.5), Timestamp.from(Instant.now()));
             rank++;
+        }
+    }
+
+    private void tryIndexVectorDocument(String userId, String sourceType, UUID sourceId, String content, String reason, Instant createdAt) {
+        try {
+            modelServiceClient.upsertVectors(new VectorUpsertRequest(
+                    UUID.randomUUID().toString(),
+                    List.of(new VectorDocumentDto(
+                            sourceType + "_" + sourceId,
+                            userId,
+                            sourceType,
+                            sourceId.toString(),
+                            content,
+                            reason,
+                            createdAt.toString()
+                    ))
+            ));
+        } catch (RuntimeException error) {
+            audit(userId, "vector.index_failed", sourceType, sourceId, Map.of(
+                    "errorType", error.getClass().getSimpleName(),
+                    "message", trim(error.getMessage(), 300)
+            ));
         }
     }
 
@@ -546,6 +671,19 @@ public class DemoPipelineService {
         Object value = row.get("valueText") != null ? row.get("valueText") : row.get("valueNumeric");
         Object unit = row.get("unit") == null ? "" : row.get("unit");
         return row.get("eventType") + ": " + value + unit;
+    }
+
+    private String displayHealthValue(String valueText, Number valueNumeric, String unit) {
+        Object value = valueText != null && !valueText.isBlank() ? valueText : valueNumeric;
+        return String.valueOf(value == null ? "" : value) + (unit == null ? "" : unit);
+    }
+
+    private UUID parseUuid(String value) {
+        try {
+            return UUID.fromString(value);
+        } catch (RuntimeException error) {
+            return null;
+        }
     }
 
     private Map<String, Object> row(String sql, Object... args) {
@@ -670,6 +808,18 @@ public class DemoPipelineService {
             }
         }
         return escaped.toString();
+    }
+
+    private static Timestamp windowTimestamp(Instant value, Instant defaultValue) {
+        Instant resolved = value != null ? value : defaultValue;
+        return resolved == null ? null : Timestamp.from(resolved);
+    }
+
+    private static Instant timestampValue(Object value, Instant defaultValue) {
+        if (value instanceof Timestamp timestamp) {
+            return timestamp.toInstant();
+        }
+        return defaultValue;
     }
 
     private static String trim(String value, int max) {

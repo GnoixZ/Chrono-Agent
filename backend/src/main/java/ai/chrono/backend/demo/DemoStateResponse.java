@@ -6,6 +6,7 @@ import java.util.Map;
 public record DemoStateResponse(
         String userId,
         List<Map<String, Object>> audioEvents,
+        List<Map<String, Object>> audioStreamSessions,
         List<Map<String, Object>> healthEvents,
         List<Map<String, Object>> conversationMemories,
         List<Map<String, Object>> speakerClusters,
