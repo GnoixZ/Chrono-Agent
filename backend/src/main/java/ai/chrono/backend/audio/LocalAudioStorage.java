@@ -50,6 +50,18 @@ public class LocalAudioStorage implements AudioStorage {
     }
 
     @Override
+    public byte[] read(String audioUri) {
+        if (audioUri == null || !audioUri.startsWith("local://")) {
+            throw new IllegalArgumentException("unsupported audio uri");
+        }
+        try {
+            return Files.readAllBytes(root.resolve(audioUri.substring("local://".length())));
+        } catch (IOException error) {
+            throw new IllegalStateException("failed to read audio", error);
+        }
+    }
+
+    @Override
     public void delete(String audioUri) {
         if (audioUri != null && audioUri.startsWith("local://")) {
             try {

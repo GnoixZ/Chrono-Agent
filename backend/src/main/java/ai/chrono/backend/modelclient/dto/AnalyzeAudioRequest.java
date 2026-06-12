@@ -8,6 +8,8 @@ public record AnalyzeAudioRequest(
         @JSONField(name = "user_id") String userId,
         @JSONField(name = "audio_event_id") String audioEventId,
         @JSONField(name = "audio_uri") String audioUri,
+        @JSONField(name = "audio_content_base64") String audioContentBase64,
+        @JSONField(name = "audio_format") String audioFormat,
         @JSONField(name = "started_at") String startedAt,
         @JSONField(name = "ended_at") String endedAt,
         @JSONField(name = "known_speakers") List<KnownSpeakerDto> knownSpeakers

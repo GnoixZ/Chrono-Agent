@@ -116,6 +116,41 @@ class AudioStreamWebSocketHandlerTest {
     }
 
     @Test
+    void startAliasControlMessageStartsSession() throws Exception {
+        TestFixture fixture = new TestFixture();
+
+        fixture.handler.afterConnectionEstablished(fixture.session);
+        fixture.handler.handleTextMessage(fixture.session, new TextMessage("{\"type\":\"start\"}"));
+
+        assertThat(fixture.outboundMessages).anyMatch(message -> message.contains("\"type\":\"session_started\""));
+    }
+
+    @Test
+    void unknownControlMessageIsIgnoredWithoutError() throws Exception {
+        TestFixture fixture = new TestFixture();
+
+        fixture.handler.afterConnectionEstablished(fixture.session);
+        fixture.handler.handleTextMessage(fixture.session, new TextMessage("{\"type\":\"noop\"}"));
+
+        assertThat(fixture.outboundMessages).anyMatch(message -> message.contains("\"type\":\"control_ignored\""));
+        assertThat(fixture.outboundMessages).noneMatch(message -> message.contains("\"type\":\"error\""));
+    }
+
+    @Test
+    void reconnectReplacesExistingActiveStreamForUser() throws Exception {
+        TestFixture fixture = new TestFixture();
+        WebSocketSession reconnectSession = fixture.newSession("session-2", "test-user");
+
+        fixture.handler.afterConnectionEstablished(fixture.session);
+        fixture.handler.afterConnectionEstablished(reconnectSession);
+
+        assertThat(fixture.outboundMessages.stream().filter(message -> message.contains("\"type\":\"stream_opened\"")).count()).isEqualTo(2);
+        assertThat(fixture.outboundMessages).noneMatch(message -> message.contains("active audio stream already exists"));
+        assertThat(fixture.closeReasons()).contains("replaced_by_reconnect");
+        verify(fixture.session).close(any(CloseStatus.class));
+    }
+
+    @Test
     void automaticSilenceStopPersistsCloseReason() throws Exception {
         TestFixture fixture = new TestFixture();
         fixture.pipelineResults.put(fixture.audioEventIds.get(0), completedResult(fixture.audioEventIds.get(0), null));
@@ -127,7 +162,29 @@ class AudioStreamWebSocketHandlerTest {
 
         assertThat(fixture.closeReasons()).contains("silence_timeout_60s");
         assertThat(fixture.outboundMessages).anyMatch(message ->
-                message.contains("\"type\":\"processing_completed\"") && message.contains("\"closeReason\":\"silence_timeout_60s\""));
+                message.contains("\"type\":\"processing_completed\"")
+                        && message.contains("\"sessionState\":\"listening\"")
+                        && message.contains("\"closeReason\":\"silence_timeout_60s\""));
+        assertThat(fixture.outboundMessages.stream().filter(message -> message.contains("\"type\":\"stream_opened\"")).count()).isEqualTo(2);
+        verify(fixture.session, times(0)).close(any(CloseStatus.class));
+    }
+
+    @Test
+    void silenceStopWithoutChunksKeepsWebSocketListening() throws Exception {
+        TestFixture fixture = new TestFixture();
+
+        fixture.handler.afterConnectionEstablished(fixture.session);
+        fixture.handler.handleTextMessage(fixture.session, new TextMessage("{\"type\":\"session_started\"}"));
+        fixture.handler.handleTextMessage(fixture.session, new TextMessage("{\"type\":\"stop\",\"reason\":\"silence_timeout_60s\"}"));
+
+        assertThat(fixture.closeReasons()).contains("silence_timeout_60s:empty_audio");
+        assertThat(fixture.outboundMessages).anyMatch(message ->
+                message.contains("\"type\":\"processing_completed\"")
+                        && message.contains("\"processingStatus\":\"discarded\"")
+                        && message.contains("\"sessionState\":\"listening\""));
+        assertThat(fixture.outboundMessages.stream().filter(message -> message.contains("\"type\":\"stream_opened\"")).count()).isEqualTo(2);
+        verify(fixture.session, times(0)).close(any(CloseStatus.class));
+        verifyNoInteractions(fixture.audioAnalyzeTaskService);
     }
 
     private static DemoAudioResult completedResult(UUID audioEventId, String conversationMemoryId) {
@@ -168,14 +225,7 @@ class AudioStreamWebSocketHandlerTest {
 
         private TestFixture() {
             try {
-                when(session.getId()).thenReturn("session-1");
-                when(session.getUri()).thenReturn(URI.create("ws://localhost/ws/audio?userId=test-user"));
-                when(session.isOpen()).thenReturn(true);
-                doAnswer(invocation -> {
-                    outboundMessages.add(((TextMessage) invocation.getArgument(0)).getPayload());
-                    return null;
-                }).when(session).sendMessage(any(TextMessage.class));
-                doAnswer(invocation -> null).when(session).close(any(CloseStatus.class));
+                configureSession(session, "session-1", "test-user");
                 when(demoPipelineService.enqueueAudioAnalysis(anyString(), anyString(), any(byte[].class), anyString(), any(UUID.class), any(DemoPipelineService.AudioWindowMetadata.class)))
                         .thenAnswer(invocation -> {
                             fileNames.add(invocation.getArgument(1, String.class));
@@ -217,6 +267,23 @@ class AudioStreamWebSocketHandlerTest {
             } catch (Exception error) {
                 throw new IllegalStateException(error);
             }
+        }
+
+        private WebSocketSession newSession(String id, String userId) throws Exception {
+            WebSocketSession nextSession = mock(WebSocketSession.class);
+            configureSession(nextSession, id, userId);
+            return nextSession;
+        }
+
+        private void configureSession(WebSocketSession targetSession, String id, String userId) throws Exception {
+            when(targetSession.getId()).thenReturn(id);
+            when(targetSession.getUri()).thenReturn(URI.create("ws://localhost/ws/audio?userId=" + userId));
+            when(targetSession.isOpen()).thenReturn(true);
+            doAnswer(invocation -> {
+                outboundMessages.add(((TextMessage) invocation.getArgument(0)).getPayload());
+                return null;
+            }).when(targetSession).sendMessage(any(TextMessage.class));
+            doAnswer(invocation -> null).when(targetSession).close(any(CloseStatus.class));
         }
 
         private void setCurrentWindowStartedAtSecondsAgo(long secondsAgo) throws Exception {

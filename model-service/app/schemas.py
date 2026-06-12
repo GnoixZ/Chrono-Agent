@@ -12,6 +12,8 @@ class AnalyzeAudioRequest(BaseModel):
     user_id: str
     audio_event_id: str
     audio_uri: str
+    audio_content_base64: str | None = None
+    audio_format: str | None = None
     started_at: str
     ended_at: str | None = None
     known_speakers: list[KnownSpeaker] = Field(default_factory=list)

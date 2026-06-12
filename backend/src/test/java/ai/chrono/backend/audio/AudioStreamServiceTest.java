@@ -3,19 +3,18 @@ package ai.chrono.backend.audio;
 import org.junit.jupiter.api.Test;
 
 import static org.assertj.core.api.Assertions.assertThat;
-import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 class AudioStreamServiceTest {
     @Test
-    void rejectsSecondActiveStreamForSameUser() {
+    void replacesActiveStreamForSameUser() {
         AudioStreamService service = new AudioStreamService();
 
         AudioStreamSessionResponse first = service.open("user-1");
+        AudioStreamSessionResponse second = service.open("user-1");
 
         assertThat(first.status()).isEqualTo("active");
-        assertThatThrownBy(() -> service.open("user-1"))
-                .isInstanceOf(IllegalStateException.class)
-                .hasMessage("active audio stream already exists");
+        assertThat(second.status()).isEqualTo("active");
+        assertThat(second.streamSessionId()).isNotEqualTo(first.streamSessionId());
     }
 
     @Test

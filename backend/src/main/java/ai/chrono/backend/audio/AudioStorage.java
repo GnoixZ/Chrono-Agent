@@ -7,6 +7,8 @@ public interface AudioStorage {
 
     Optional<StoredAudio> find(String audioUri);
 
+    byte[] read(String audioUri);
+
     void delete(String audioUri);
 
     record AudioInput(String userId, String fileName, byte[] bytes) {

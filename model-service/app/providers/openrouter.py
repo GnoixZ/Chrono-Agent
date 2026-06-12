@@ -31,15 +31,21 @@ class OpenRouterChatClient:
             timeout_seconds=float(os.getenv("CHRONO_OPENROUTER_TIMEOUT_SECONDS", "30")),
         )
 
-    def complete(self, messages: list[dict[str, str]]) -> str:
+    def complete(
+        self,
+        messages: list[dict[str, Any]],
+        *,
+        temperature: float = 0.35,
+        max_tokens: int = 700,
+    ) -> str:
         if not self.api_key:
             raise OpenRouterUnavailable("OpenRouter API key is not configured")
 
         payload = {
             "model": self.model,
             "messages": messages,
-            "temperature": 0.35,
-            "max_tokens": 700,
+            "temperature": temperature,
+            "max_tokens": max_tokens,
             "stream": False,
         }
         request = urllib.request.Request(

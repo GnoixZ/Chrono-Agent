@@ -35,7 +35,10 @@ def health() -> dict[str, str]:
 
 @app.post("/v1/audio/analyze", response_model=AnalyzeAudioResponse)
 def analyze_audio(request: AnalyzeAudioRequest) -> AnalyzeAudioResponse:
-    return audio_service.analyze(request)
+    try:
+        return audio_service.analyze(request)
+    except OpenRouterUnavailable as error:
+        raise HTTPException(status_code=502, detail=str(error)) from error
 
 
 @app.post("/v1/audio/transcript", response_model=IncrementalTranscriptResponse)

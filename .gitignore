@@ -12,6 +12,7 @@ node_modules/
 .DS_Store
 audio-data/
 tmp/
+logs/
 .env
 .env.local
 model-service/.env.local

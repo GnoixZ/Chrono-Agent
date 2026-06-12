@@ -16,7 +16,6 @@ import ai.chrono.backend.modelclient.dto.VectorSearchRequest;
 import ai.chrono.backend.modelclient.dto.VectorSearchResponse;
 import ai.chrono.backend.modelclient.dto.VectorUpsertRequest;
 import ai.chrono.backend.speaker.PersonInsightService;
-import ai.chrono.backend.speaker.SpeakerLabelSuggestionService;
 import ai.chrono.backend.task.ModelJobService;
 import com.alibaba.fastjson2.JSON;
 import com.alibaba.fastjson2.JSONException;
@@ -31,11 +30,11 @@ import java.sql.Timestamp;
 import java.time.Instant;
 import java.time.temporal.ChronoUnit;
 import java.util.ArrayList;
+import java.util.Base64;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
-import java.util.Optional;
 import java.util.UUID;
 
 @Service
@@ -63,7 +62,6 @@ public class DemoPipelineService {
     private final ModelJobService modelJobService;
     private final HealthService healthService;
     private final MemoryCandidateDecisionService memoryDecisionService;
-    private final SpeakerLabelSuggestionService labelSuggestionService;
     private final PersonInsightService personInsightService;
 
     public DemoPipelineService(
@@ -73,7 +71,6 @@ public class DemoPipelineService {
             ModelJobService modelJobService,
             HealthService healthService,
             MemoryCandidateDecisionService memoryDecisionService,
-            SpeakerLabelSuggestionService labelSuggestionService,
             PersonInsightService personInsightService
     ) {
         this.jdbc = jdbc;
@@ -82,7 +79,6 @@ public class DemoPipelineService {
         this.modelJobService = modelJobService;
         this.healthService = healthService;
         this.memoryDecisionService = memoryDecisionService;
-        this.labelSuggestionService = labelSuggestionService;
         this.personInsightService = personInsightService;
     }
 
@@ -139,7 +135,7 @@ public class DemoPipelineService {
     @Transactional
     public DemoAudioResult processPendingAudio(UUID audioEventId) {
         Map<String, Object> audioEvent = jdbc.queryForMap("""
-                select user_id, audio_uri, started_at, ended_at, stream_session_id, window_index
+                select user_id, audio_uri, started_at, ended_at, stream_session_id, window_index, codec
                 from audio_event
                 where id = ?
                 """, audioEventId);
@@ -148,6 +144,10 @@ public class DemoPipelineService {
         Instant startedAt = timestampValue(audioEvent.get("started_at"), Instant.now());
         Instant endedAt = timestampValue(audioEvent.get("ended_at"), startedAt);
         UUID streamSessionId = parseUuid(String.valueOf(audioEvent.get("stream_session_id")));
+        byte[] audioBytes = audioStorage.read(audioUri);
+        String audioContentBase64 = Base64.getEncoder().encodeToString(audioBytes);
+        Object codecValue = audioEvent.get("codec");
+        String audioFormat = codecValue == null ? "webm" : blankToDefault(String.valueOf(codecValue), "webm");
         UUID modelJobId = jdbc.queryForObject("""
                 select id
                 from model_job
@@ -170,6 +170,8 @@ public class DemoPipelineService {
                     userId,
                     audioEventId.toString(),
                     audioUri,
+                    audioContentBase64,
+                    audioFormat,
                     startedAt.toString(),
                     endedAt.toString(),
                     List.of()
@@ -618,35 +620,9 @@ public class DemoPipelineService {
                                 transcript, language, confidence, emotion_tags, topic_tags, created_at
                             ) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, %s, %s, ?)
                             """.formatted(JSONB, JSONB),
-                    segmentId, audioEventId, clusterId, segment.speakerId(), false, segment.startMs(), segment.endMs(),
+                    segmentId, audioEventId, clusterId, segment.speakerId(), true, segment.startMs(), segment.endMs(),
                     segment.transcript(), response.language(), value(segment.confidence(), 0.0),
                     json(nullSafe(segment.emotionTags())), json(nullSafe(segment.topicTags())), Timestamp.from(now));
-
-            matchingEmbedding(response.speakerEmbeddings(), segment.speakerId()).ifPresent(embedding -> {
-                jdbc.update("""
-                                insert into speaker_embedding (
-                                    id, speaker_cluster_id, audio_event_id, embedding_ref, model_name, quality_score, created_at, expires_at
-                                ) values (?, ?, ?, ?, ?, ?, ?, ?)
-                                """,
-                        UUID.randomUUID(), clusterId, audioEventId, embedding.embeddingRef(), "fake-voiceprint",
-                        value(embedding.qualityScore(), 0.0), Timestamp.from(now), Timestamp.from(now.plus(90, ChronoUnit.DAYS)));
-            });
-
-            labelSuggestionService.suggestFromTranscript(segment.transcript()).ifPresent(label -> {
-                jdbc.update("""
-                                update speaker_cluster
-                                set label_suggestion = ?, label_suggestion_source = ?, label_suggestion_confidence = ?, updated_at = ?
-                                where id = ? and user_labeled = false
-                                """,
-                        label, "self_introduction_text", 0.72, Timestamp.from(now), clusterId);
-                jdbc.update("""
-                                insert into speaker_label_suggestion (
-                                    id, speaker_cluster_id, suggested_label, source_type, evidence_ref, confidence, status, created_at
-                                ) values (?, ?, ?, ?, ?, ?, ?, ?)
-                                """,
-                        UUID.randomUUID(), clusterId, label, "self_introduction_text", "speaker_segment://" + segmentId, 0.72,
-                        "pending", Timestamp.from(now));
-            });
 
             speakerRefs.add(linkedMap(
                     "speakerClusterId", clusterId.toString(),
@@ -661,9 +637,9 @@ public class DemoPipelineService {
 
     private UUID getOrCreateSpeakerCluster(String userId, AnalyzeAudioResponse.SpeakerSegmentDto segment, Instant now) {
         List<UUID> existing = jdbc.query(
-                "select id from speaker_cluster where user_id = ? and deleted_at is null order by last_seen_at desc limit 1",
+                "select id from speaker_cluster where user_id = ? and display_name = ? and deleted_at is null order by last_seen_at desc limit 1",
                 (rs, rowNum) -> (UUID) rs.getObject("id"),
-                userId
+                userId, "本人"
         );
         if (!existing.isEmpty()) {
             UUID id = existing.get(0);
@@ -672,11 +648,10 @@ public class DemoPipelineService {
                             set last_seen_at = ?, match_confidence_summary = %s, updated_at = ?
                             where id = ?
                             """.formatted(JSONB),
-                    Timestamp.from(now), json(Map.of("lastSegmentConfidence", value(segment.confidence(), 0.0), "source", "fake_voiceprint")),
+                    Timestamp.from(now), json(Map.of("lastSegmentConfidence", value(segment.confidence(), 0.0), "source", "self_assigned")),
                     Timestamp.from(now), id);
             return id;
         }
-        int nextIndex = jdbc.queryForObject("select count(*) from speaker_cluster where user_id = ?", Integer.class, userId) + 1;
         UUID id = UUID.randomUUID();
         jdbc.update("""
                         insert into speaker_cluster (
@@ -684,10 +659,10 @@ public class DemoPipelineService {
                             match_confidence_summary, user_labeled, created_at, updated_at
                         ) values (?, ?, ?, ?, ?, ?, ?, %s, ?, ?, ?)
                         """.formatted(JSONB),
-                id, userId, "Unknown Person " + nextIndex, "unknown", "voice_embedding", Timestamp.from(now), Timestamp.from(now),
-                json(Map.of("initialSegmentConfidence", value(segment.confidence(), 0.0), "source", "fake_voiceprint")),
-                false, Timestamp.from(now), Timestamp.from(now));
-        audit(userId, "speaker_cluster.created", "speaker_cluster", id, Map.of("displayName", "Unknown Person " + nextIndex));
+                id, userId, "本人", "known", "self_assigned", Timestamp.from(now), Timestamp.from(now),
+                json(Map.of("initialSegmentConfidence", value(segment.confidence(), 0.0), "source", "self_assigned")),
+                true, Timestamp.from(now), Timestamp.from(now));
+        audit(userId, "speaker_cluster.created", "speaker_cluster", id, Map.of("displayName", "本人"));
         return id;
     }
 
@@ -801,12 +776,6 @@ public class DemoPipelineService {
                         """,
                 id, userId, "Demo Agent 会话", "demo_chat", Timestamp.from(now), Timestamp.from(now), "active", "web_demo");
         return id;
-    }
-
-    private Optional<AnalyzeAudioResponse.SpeakerEmbeddingDto> matchingEmbedding(List<AnalyzeAudioResponse.SpeakerEmbeddingDto> embeddings, Integer speakerId) {
-        return nullSafe(embeddings).stream()
-                .filter(embedding -> speakerId != null && speakerId.equals(embedding.speakerId()))
-                .findFirst();
     }
 
     private Map<String, Object> contextItem(String sourceType, Object sourceId, Object content, String reason, double score) {
