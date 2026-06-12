@@ -37,6 +37,7 @@ class OpenRouterChatClient:
         *,
         temperature: float = 0.35,
         max_tokens: int = 700,
+        reasoning_effort: str | None = None,
     ) -> str:
         if not self.api_key:
             raise OpenRouterUnavailable("OpenRouter API key is not configured")
@@ -48,6 +49,8 @@ class OpenRouterChatClient:
             "max_tokens": max_tokens,
             "stream": False,
         }
+        if reasoning_effort:
+            payload["reasoning_effort"] = reasoning_effort
         request = urllib.request.Request(
             f"{self.base_url}/chat/completions",
             data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
@@ -74,6 +77,8 @@ class OpenRouterChatClient:
         except (KeyError, IndexError, TypeError, json.JSONDecodeError) as error:
             raise OpenRouterUnavailable("OpenRouter response did not contain a chat completion") from error
 
+        if content is None:
+            raise OpenRouterUnavailable("OpenRouter returned an empty chat completion")
         content = str(content).strip()
         if not content:
             raise OpenRouterUnavailable("OpenRouter returned an empty chat completion")

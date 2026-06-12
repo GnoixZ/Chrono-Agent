@@ -232,7 +232,7 @@ public class DemoPipelineService {
                 json(nullSafe(response.summary().suggestedActions())), json(nullSafe(response.summary().suggestedEvents())),
                 Timestamp.from(now), Timestamp.from(now));
 
-        persistMemoryCandidates(response.memoryCandidates(), null, conversationMemoryId, null, "model_suggested");
+        persistMemoryCandidates(userId, response.memoryCandidates(), null, conversationMemoryId, null, "model_suggested");
         persistPersonInsights(userId, speakerRefs, now);
         tryIndexVectorDocument(
                 userId,
@@ -335,10 +335,10 @@ public class DemoPipelineService {
                 json(List.of()), json(List.of()), json(evidenceRefs), Timestamp.from(now), Timestamp.from(now));
 
         if (!discarded) {
-            persistMemoryCandidates(List.of(new AnalyzeAudioResponse.MemoryCandidateDto(
+            persistMemoryCandidates(userId, List.of(new AnalyzeAudioResponse.MemoryCandidateDto(
                     "conversation_context",
-                    "用户完成了一次流式语音会话：" + trim(overview, 160),
-                    0.58,
+                    "用户最近的流式语音会话内容：" + trim(overview, 220),
+                    0.78,
                     "normal"
             )), null, conversationMemoryId, null, "session_post_processing");
             persistPersonInsights(userId, speakerRefs, now);
@@ -586,7 +586,7 @@ public class DemoPipelineService {
                         ) values (?, ?, ?, ?, ?, ?, ?, ?, ?)
                         """,
                 assistantMessageId, sessionId, request.userId(), "assistant", "text", reply.content(), "fake-provider", safetyLevel, Timestamp.from(Instant.now()));
-        persistMemoryCandidates(reply.memoryCandidates(), sessionId, null, assistantMessageId, "agent_reply");
+        persistMemoryCandidates(request.userId(), reply.memoryCandidates(), sessionId, null, assistantMessageId, "agent_reply");
         jdbc.update("""
                         update agent_run
                         set status = ?, short_term_memory_ref = ?, retrieved_context_ref = ?, model_response_ref = ?, safety_result = %s, completed_at = ?
@@ -690,6 +690,7 @@ public class DemoPipelineService {
     }
 
     private void persistMemoryCandidates(
+            String userId,
             List<AnalyzeAudioResponse.MemoryCandidateDto> candidates,
             UUID conversationSessionId,
             UUID conversationMemoryId,
@@ -698,15 +699,52 @@ public class DemoPipelineService {
     ) {
         for (AnalyzeAudioResponse.MemoryCandidateDto candidate : nullSafe(candidates)) {
             String decision = memoryDecisionService.decide(sourceType, blankToDefault(candidate.sensitivity(), "normal"), value(candidate.confidence(), 0.0));
+            UUID candidateId = UUID.randomUUID();
+            Instant now = Instant.now();
             jdbc.update("""
                             insert into memory_write_candidate (
                                 id, conversation_session_id, conversation_memory_id, source_message_id, source_type, memory_type,
-                                content, confidence, decision, decision_reason, created_at
-                            ) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                                content, confidence, decision, decision_reason, created_at, decided_at
+                            ) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                             """,
-                    UUID.randomUUID(), conversationSessionId, conversationMemoryId, sourceMessageId, sourceType, candidate.memoryType(),
-                    candidate.content(), value(candidate.confidence(), 0.0), decision, "demo_pipeline", Timestamp.from(Instant.now()));
+                    candidateId, conversationSessionId, conversationMemoryId, sourceMessageId, sourceType, candidate.memoryType(),
+                    candidate.content(), value(candidate.confidence(), 0.0), decision, "demo_pipeline", Timestamp.from(now),
+                    "auto_saved".equals(decision) ? Timestamp.from(now) : null);
+            if ("auto_saved".equals(decision)) {
+                persistAutoSavedMemoryItem(userId, candidateId, candidate, sourceType, conversationMemoryId, sourceMessageId, now);
+            }
         }
+    }
+
+    private void persistAutoSavedMemoryItem(
+            String userId,
+            UUID candidateId,
+            AnalyzeAudioResponse.MemoryCandidateDto candidate,
+            String sourceType,
+            UUID conversationMemoryId,
+            UUID sourceMessageId,
+            Instant now
+    ) {
+        UUID memoryId = UUID.randomUUID();
+        List<Map<String, Object>> evidenceRefs = new ArrayList<>();
+        evidenceRefs.add(linkedMap("type", "memory_write_candidate", "id", candidateId.toString()));
+        if (conversationMemoryId != null) {
+            evidenceRefs.add(linkedMap("type", "conversation_memory", "id", conversationMemoryId.toString()));
+        }
+        if (sourceMessageId != null) {
+            evidenceRefs.add(linkedMap("type", "agent_message", "id", sourceMessageId.toString()));
+        }
+        jdbc.update("""
+                        insert into memory_item (
+                            id, user_id, source_type, memory_type, scope, subject_type, subject_id, content, confidence, source,
+                            evidence_refs, created_at, updated_at, valid_at
+                        ) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, %s, ?, ?, ?)
+                        """.formatted(JSONB),
+                memoryId, userId, sourceType, blankToDefault(candidate.memoryType(), "conversation_context"), "personal",
+                null, null, candidate.content(), value(candidate.confidence(), 0.0), sourceType,
+                json(evidenceRefs), Timestamp.from(now), Timestamp.from(now), Timestamp.from(now));
+        tryIndexVectorDocument(userId, "memory_item", memoryId, candidate.content(), "自动保存的长期个人记忆", now);
+        audit(userId, "memory.auto_saved", "memory_item", memoryId, Map.of("candidateId", candidateId.toString(), "sourceType", sourceType));
     }
 
     private List<Map<String, Object>> recallContext(String userId, String query) {

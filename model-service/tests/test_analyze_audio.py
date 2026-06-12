@@ -76,9 +76,13 @@ def test_openrouter_audio_provider_sends_input_audio_and_marks_speaker_as_self()
     class FakeChatClient:
         def __init__(self) -> None:
             self.messages = []
+            self.reasoning_effort = None
+            self.max_tokens = None
 
-        def complete(self, messages, *, temperature=0.35, max_tokens=700):  # noqa: ANN001
+        def complete(self, messages, *, temperature=0.35, max_tokens=700, reasoning_effort=None):  # noqa: ANN001
             self.messages = messages
+            self.max_tokens = max_tokens
+            self.reasoning_effort = reasoning_effort
             return """
             {
               "language": "zh",
@@ -113,7 +117,7 @@ def test_openrouter_audio_provider_sends_input_audio_and_marks_speaker_as_self()
             """
 
     chat_client = FakeChatClient()
-    provider = OpenRouterAudioAnalyzeProvider(chat_client=chat_client)
+    provider = OpenRouterAudioAnalyzeProvider(chat_client=chat_client, mode="chat_audio")
 
     result = provider.analyze_audio(
         AnalyzeAudioRequest(
@@ -132,9 +136,165 @@ def test_openrouter_audio_provider_sends_input_audio_and_marks_speaker_as_self()
     content = chat_client.messages[1]["content"]
     assert content[1]["type"] == "input_audio"
     assert content[1]["input_audio"]["data"] == "d2ViaQ=="
+    assert chat_client.max_tokens == 4096
+    assert chat_client.reasoning_effort == "none"
     assert result.segments[0].speaker_id == 0
     assert result.segments[0].transcript == "今天状态不错。"
     assert result.speaker_embeddings == []
+
+
+def test_openrouter_audio_provider_uses_dedicated_transcription_by_default() -> None:
+    class FakeTranscriptionClient:
+        def __init__(self) -> None:
+            self.audio_content_base64 = None
+            self.audio_format_value = None
+            self.language = None
+
+        def transcribe(self, audio_content_base64, audio_format_value, language="zh"):  # noqa: ANN001
+            self.audio_content_base64 = audio_content_base64
+            self.audio_format_value = audio_format_value
+            self.language = language
+            return "你好，我今天想聊聊真实的心情。"
+
+    transcription_client = FakeTranscriptionClient()
+    provider = OpenRouterAudioAnalyzeProvider(transcription_client=transcription_client)
+
+    result = provider.analyze_audio(
+        AnalyzeAudioRequest(
+            request_id="req-transcription",
+            user_id="user-1",
+            audio_event_id="audio-transcription",
+            audio_uri="local://user-1/audio.webm",
+            audio_content_base64="d2ViaQ==",
+            audio_format="webm",
+            started_at="2026-06-12T10:00:00Z",
+            ended_at="2026-06-12T10:00:02Z",
+            known_speakers=[],
+        )
+    )
+
+    assert transcription_client.audio_content_base64 == "d2ViaQ=="
+    assert transcription_client.audio_format_value == "webm"
+    assert transcription_client.language == "zh"
+    assert result.segments[0].speaker_id == 0
+    assert result.segments[0].transcript == "你好，我今天想聊聊真实的心情。"
+    assert result.summary.overview == "你好，我今天想聊聊真实的心情。"
+    assert result.memory_candidates == []
+
+
+def test_openrouter_audio_provider_falls_back_when_model_returns_invalid_json() -> None:
+    class FakeChatClient:
+        def complete(self, messages, *, temperature=0.35, max_tokens=700, reasoning_effort=None):  # noqa: ANN001, ARG002
+            return '''
+            {
+              "language": "zh",
+              "segments": [
+                {"speaker_id": 0, "transcript": "我今天晚上想做一个 demo。",}
+              ]
+            '''
+
+    provider = OpenRouterAudioAnalyzeProvider(chat_client=FakeChatClient(), mode="chat_audio")
+
+    result = provider.analyze_audio(
+        AnalyzeAudioRequest(
+            request_id="req-invalid-json",
+            user_id="user-1",
+            audio_event_id="audio-invalid-json",
+            audio_uri="local://user-1/audio.webm",
+            audio_content_base64="d2ViaQ==",
+            audio_format="webm",
+            started_at="2026-06-12T10:00:00Z",
+            ended_at="2026-06-12T10:00:02Z",
+            known_speakers=[],
+        )
+    )
+
+    assert result.segments[0].speaker_id == 0
+    assert result.segments[0].transcript == "我今天晚上想做一个 demo。"
+    assert result.summary.discard is False
+    assert result.summary.title == "语音会话转写"
+
+
+def test_openrouter_audio_provider_discards_none_like_fallback() -> None:
+    class FakeChatClient:
+        def complete(self, messages, *, temperature=0.35, max_tokens=700, reasoning_effort=None):  # noqa: ANN001, ARG002
+            return "None"
+
+    provider = OpenRouterAudioAnalyzeProvider(chat_client=FakeChatClient(), mode="chat_audio")
+
+    result = provider.analyze_audio(
+        AnalyzeAudioRequest(
+            request_id="req-none",
+            user_id="user-1",
+            audio_event_id="audio-none",
+            audio_uri="local://user-1/audio.webm",
+            audio_content_base64="d2ViaQ==",
+            audio_format="webm",
+            started_at="2026-06-12T10:00:00Z",
+            known_speakers=[],
+        )
+    )
+
+    assert result.segments == []
+    assert result.summary.discard is True
+
+
+def test_openrouter_audio_provider_accepts_string_memory_candidates_and_actions() -> None:
+    class FakeChatClient:
+        def complete(self, messages, *, temperature=0.35, max_tokens=700, reasoning_effort=None):  # noqa: ANN001, ARG002
+            return """
+            {
+              "language": "Mandarin Chinese",
+              "segments": [
+                {
+                  "speaker_id": 0,
+                  "start_ms": 0,
+                  "end_ms": 3000,
+                  "transcript": "我今天晚上想做一个 demo。",
+                  "confidence": 0.86,
+                  "emotion_tags": [],
+                  "topic_tags": ["demo"]
+                }
+              ],
+              "summary": {
+                "title": "Demo 计划",
+                "overview": "用户说今天晚上想做一个 demo。",
+                "topic_tags": ["demo"],
+                "emotion_tags": [],
+                "suggested_actions": ["询问 demo 的主题"],
+                "suggested_events": [],
+                "discard": false,
+                "discard_reason": ""
+              },
+              "memory_candidates": [
+                "用户今天晚上想做一个 demo"
+              ],
+              "safety": {
+                "level": "normal",
+                "requires_crisis_response": false,
+                "reason": null
+              }
+            }
+            """
+
+    provider = OpenRouterAudioAnalyzeProvider(chat_client=FakeChatClient(), mode="chat_audio")
+
+    result = provider.analyze_audio(
+        AnalyzeAudioRequest(
+            request_id="req-string-candidates",
+            user_id="user-1",
+            audio_event_id="audio-string-candidates",
+            audio_uri="local://user-1/audio.webm",
+            audio_content_base64="d2ViaQ==",
+            audio_format="webm",
+            started_at="2026-06-12T10:00:00Z",
+            known_speakers=[],
+        )
+    )
+
+    assert result.summary.suggested_actions[0].text == "询问 demo 的主题"
+    assert result.memory_candidates[0].content == "用户今天晚上想做一个 demo"
+    assert result.memory_candidates[0].memory_type == "conversation_context"
 
 
 def test_audio_analyze_api_returns_502_when_openrouter_audio_unavailable(monkeypatch) -> None:

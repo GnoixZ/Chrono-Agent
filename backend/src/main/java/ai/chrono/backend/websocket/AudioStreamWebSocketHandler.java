@@ -32,7 +32,6 @@ import java.util.concurrent.ConcurrentMap;
 
 @Component
 public class AudioStreamWebSocketHandler extends BinaryWebSocketHandler {
-    private static final Duration WINDOW_DURATION = Duration.ofSeconds(30);
     private static final Duration MIN_DISCONNECT_TAIL_DURATION = Duration.ofSeconds(3);
     private static final String DEFAULT_STREAM_FILE_NAME = "browser-stream.webm";
     private static final String SESSION_STATUS_LISTENING = "listening";
@@ -218,10 +217,6 @@ public class AudioStreamWebSocketHandler extends BinaryWebSocketHandler {
                     {"type":"chunk_received","chunks":%d,"bytes":%d}
                     """.formatted(state.totalChunks(), state.totalBytes()).trim());
             sendIncrementalTranscript(session, state, bytes.length);
-            if (state.currentWindowDuration(Instant.now()).compareTo(WINDOW_DURATION) < 0) {
-                return;
-            }
-            flushWindow(session, session.getId(), state, DEFAULT_STREAM_FILE_NAME, false);
         } catch (RuntimeException error) {
             updateSessionStatus(state, SESSION_STATUS_CLOSED, null);
             closeStream(state, "processing_failed", parseUuid(state.lastAudioEventId()));

@@ -35,8 +35,8 @@ button {
   border-radius: 6px;
   background: #f8fafb;
   color: var(--ink);
-  min-height: 36px;
-  padding: 7px 12px;
+  min-height: 32px;
+  padding: 5px 10px;
   cursor: pointer;
   transition: transform .12s ease, box-shadow .12s ease, background .12s ease;
 }
@@ -57,13 +57,13 @@ button.primary {
 }
 
 input, select {
-  min-height: 36px;
+  min-height: 32px;
   width: 100%;
   border: 1px solid var(--line);
   border-radius: 6px;
   background: white;
   color: var(--ink);
-  padding: 7px 9px;
+  padding: 5px 8px;
 }
 
 .topbar {
@@ -71,7 +71,7 @@ input, select {
   justify-content: space-between;
   gap: 20px;
   align-items: center;
-  padding: 22px 28px 16px;
+  padding: 16px 28px 12px;
   border-bottom: 1px solid var(--line);
   background: rgba(255, 255, 255, .88);
   backdrop-filter: blur(12px);
@@ -107,32 +107,36 @@ input, select {
 
 .workspace {
   display: grid;
-  grid-template-columns: 330px minmax(420px, 1fr) 360px;
-  gap: 16px;
-  padding: 16px;
+  grid-template-columns: minmax(0, 1fr) minmax(300px, 360px);
+  gap: 12px;
+  padding: 12px 16px;
   align-items: start;
 }
 
-.lifecycle-panel {
-  grid-column: 1 / 3;
+.primary-column,
+.utility-column {
+  display: grid;
+  gap: 12px;
+  min-width: 0;
 }
 
+.utility-column {
+  align-self: start;
+  max-height: calc(100vh - 92px);
+  overflow: auto;
+  padding-right: 2px;
+  position: sticky;
+  top: 84px;
+}
+
+.lifecycle-panel,
 .timeline-panel,
+.side-panel,
+.capture-panel,
+.data-panel,
 .agent-panel {
-  grid-column: 1 / 3;
-}
-
-.side-panel {
-  grid-column: 3;
-  grid-row: 1 / 3;
-}
-
-.capture-panel {
-  grid-column: 1;
-}
-
-.data-panel {
-  grid-column: 2 / 4;
+  grid-column: auto;
+  grid-row: auto;
 }
 
 .panel {
@@ -140,22 +144,26 @@ input, select {
   border: 1px solid var(--line);
   border-radius: 8px;
   box-shadow: var(--shadow);
-  padding: 16px;
+  padding: 12px;
   min-width: 0;
+}
+
+.ui-hidden[hidden] {
+  display: none !important;
 }
 
 .panel-title {
   display: flex;
   align-items: center;
-  gap: 10px;
-  margin-bottom: 14px;
+  gap: 9px;
+  margin-bottom: 10px;
 }
 
 .panel-title span {
   display: grid;
   place-items: center;
-  width: 30px;
-  height: 30px;
+  width: 28px;
+  height: 28px;
   border-radius: 50%;
   background: var(--ink);
   color: white;
@@ -165,13 +173,13 @@ input, select {
 
 .panel-title h2 {
   margin: 0;
-  font-size: 18px;
+  font-size: 17px;
 }
 
 .control-block {
   display: grid;
-  gap: 9px;
-  padding: 12px 0;
+  gap: 7px;
+  padding: 10px 0;
   border-top: 1px solid var(--line);
 }
 
@@ -194,10 +202,10 @@ input, select {
 }
 
 .status-line {
-  min-height: 28px;
+  min-height: 26px;
   border: 1px dashed var(--line);
   border-radius: 6px;
-  padding: 6px 8px;
+  padding: 5px 8px;
   color: var(--muted);
   font-size: 13px;
   background: #f7fafc;
@@ -205,8 +213,8 @@ input, select {
 
 .stream-progress {
   display: grid;
-  gap: 10px;
-  padding: 12px;
+  gap: 8px;
+  padding: 10px;
   border: 1px solid rgba(36, 90, 154, 0.16);
   border-radius: 10px;
   background:
@@ -251,8 +259,8 @@ input, select {
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  min-height: 28px;
-  padding: 4px 10px;
+  min-height: 24px;
+  padding: 3px 8px;
   border-radius: 999px;
   border: 1px solid rgba(36, 90, 154, 0.18);
   background: rgba(36, 90, 154, 0.08);
@@ -283,21 +291,21 @@ input, select {
 .stream-metrics {
   display: grid;
   grid-template-columns: repeat(4, minmax(0, 1fr));
-  gap: 8px;
+  gap: 6px;
 }
 
 .stream-stat {
   display: grid;
-  gap: 4px;
-  min-height: 64px;
-  padding: 10px;
+  gap: 3px;
+  min-height: 56px;
+  padding: 8px;
   border-radius: 8px;
   background: rgba(255, 255, 255, 0.82);
   border: 1px solid rgba(216, 212, 200, 0.85);
 }
 
 .stream-stat strong {
-  font-size: 18px;
+  font-size: 17px;
   line-height: 1;
 }
 
@@ -431,16 +439,16 @@ input, select {
 
 .timeline {
   display: grid;
-  gap: 12px;
+  gap: 10px;
 }
 
 .event {
   display: grid;
-  gap: 8px;
+  gap: 6px;
   border-left: 4px solid var(--blue);
   background: white;
   border-radius: 6px;
-  padding: 12px;
+  padding: 10px 12px;
 }
 
 .event h3 {
@@ -487,17 +495,17 @@ input, select {
 
 .stack {
   display: grid;
-  gap: 10px;
-  margin: 9px 0 18px;
+  gap: 8px;
+  margin: 7px 0 14px;
 }
 
 .small-card {
   background: white;
   border: 1px solid var(--line);
   border-radius: 7px;
-  padding: 10px;
+  padding: 9px;
   display: grid;
-  gap: 8px;
+  gap: 6px;
 }
 
 .small-card strong {
@@ -520,7 +528,7 @@ input, select {
 .timeline-actions {
   display: flex;
   flex-wrap: wrap;
-  gap: 8px;
+  gap: 6px;
   margin-top: 4px;
 }
 
@@ -531,12 +539,12 @@ input, select {
 }
 
 .chat-log {
-  min-height: 240px;
-  max-height: 390px;
+  min-height: 180px;
+  max-height: 300px;
   overflow: auto;
   display: grid;
-  gap: 10px;
-  padding: 8px;
+  gap: 8px;
+  padding: 7px;
   border: 1px solid var(--line);
   border-radius: 8px;
   background: #f4f7f9;
@@ -545,7 +553,7 @@ input, select {
 .message {
   max-width: 82%;
   border-radius: 8px;
-  padding: 10px 12px;
+  padding: 8px 10px;
   line-height: 1.5;
 }
 
@@ -564,7 +572,7 @@ input, select {
   display: grid;
   grid-template-columns: 1fr auto;
   gap: 8px;
-  margin: 12px 0;
+  margin: 10px 0 0;
 }
 
 .recall-grid {
@@ -584,8 +592,8 @@ input, select {
 .tabs {
   display: flex;
   flex-wrap: wrap;
-  gap: 7px;
-  margin-bottom: 10px;
+  gap: 6px;
+  margin-bottom: 8px;
 }
 
 .tab {
@@ -602,8 +610,8 @@ input, select {
 }
 
 .data-viewer {
-  min-height: 440px;
-  max-height: 620px;
+  min-height: 320px;
+  max-height: 460px;
   overflow: auto;
   margin: 0;
   border: 1px solid var(--line);
@@ -638,7 +646,7 @@ input, select {
 
 @media (max-width: 1180px) {
   .workspace {
-    grid-template-columns: 1fr 1fr;
+    grid-template-columns: minmax(0, 1fr) minmax(280px, 320px);
   }
   .lifecycle-panel,
   .timeline-panel,
@@ -654,6 +662,18 @@ input, select {
   }
 }
 
+@media (max-width: 980px) {
+  .workspace {
+    grid-template-columns: 1fr;
+  }
+  .utility-column {
+    max-height: none;
+    overflow: visible;
+    padding-right: 0;
+    position: static;
+  }
+}
+
 @media (max-width: 760px) {
   .topbar {
     align-items: stretch;
@@ -665,6 +685,10 @@ input, select {
   .workspace {
     grid-template-columns: 1fr;
     padding: 10px;
+  }
+  .primary-column,
+  .utility-column {
+    gap: 10px;
   }
   .agent-panel, .data-panel {
     grid-column: auto;

@@ -50,6 +50,7 @@ const state = {
   wsReconnectAttempts: 0,
   wsReconnectTimer: null,
   wsAudioUploadEnabled: false,
+  wsStopInProgress: false,
   sessionId: null,
   lastRecall: [],
   wsProgress: createWsProgressState()
@@ -192,6 +193,11 @@ function startWsRecorder() {
   if (!state.wsStream) {
     return;
   }
+  if (state.wsRecorder && state.wsRecorder.state === "paused") {
+    state.wsAudioUploadEnabled = true;
+    state.wsRecorder.resume();
+    return;
+  }
   if (state.wsRecorder && state.wsRecorder.state !== "inactive") {
     return;
   }
@@ -217,10 +223,46 @@ function startWsRecorder() {
 }
 
 function pauseWsRecorderForSilence() {
-  state.wsAudioUploadEnabled = false;
-  if (state.wsRecorder && state.wsRecorder.state !== "inactive") {
-    state.wsRecorder.stop();
+  if (state.wsRecorder && state.wsRecorder.state === "recording") {
+    try {
+      state.wsRecorder.requestData();
+    } catch {
+      // requestData is best effort; pause still prevents silent data from being recorded.
+    }
+    state.wsRecorder.pause();
   }
+}
+
+function finalizeWsRecorderBeforeStop() {
+  const recorder = state.wsRecorder;
+  if (!recorder || recorder.state === "inactive") {
+    state.wsRecorder = null;
+    state.wsAudioUploadEnabled = false;
+    return Promise.resolve();
+  }
+  state.wsAudioUploadEnabled = true;
+  return new Promise(resolve => {
+    let settled = false;
+    const finish = () => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      window.clearTimeout(timeout);
+      if (state.wsRecorder === recorder) {
+        state.wsRecorder = null;
+      }
+      state.wsAudioUploadEnabled = false;
+      resolve();
+    };
+    const timeout = window.setTimeout(finish, 1200);
+    recorder.addEventListener("stop", finish, { once: true });
+    try {
+      recorder.stop();
+    } catch {
+      finish();
+    }
+  });
 }
 
 function triggerWsSessionStart() {
@@ -238,15 +280,13 @@ function triggerWsSessionStart() {
   renderWsProgress();
 }
 
-function stopWebSocketSession(reason, detail) {
-  if (state.wsProgress.stopRequested) {
+async function stopWebSocketSession(reason, detail) {
+  if (state.wsProgress.stopRequested || state.wsStopInProgress) {
     return;
   }
+  state.wsStopInProgress = true;
   const continueListening = reason === "silence_timeout_60s";
-  state.wsAudioUploadEnabled = false;
-  if (state.wsRecorder && state.wsRecorder.state !== "inactive") {
-    state.wsRecorder.stop();
-  }
+  await finalizeWsRecorderBeforeStop();
   if (continueListening) {
     cleanupWsAudioGraph();
   } else {
@@ -268,6 +308,7 @@ function stopWebSocketSession(reason, detail) {
     addWsEvent(continueListening ? "静音结束会话" : "强制结束", reason);
     renderWsProgress();
   }
+  state.wsStopInProgress = false;
 }
 
 function startWsVadLoop() {
@@ -359,6 +400,9 @@ function startWsVadLoop() {
         addWsEvent("恢复人声", "静音计时已清零");
       }
       if (!state.wsProgress.stopRequested && (!state.wsRecorder || state.wsRecorder.state === "inactive")) {
+        startWsRecorder();
+        addWsEvent("恢复上传", "检测到人声，继续发送音频片段");
+      } else if (!state.wsProgress.stopRequested && state.wsRecorder?.state === "paused") {
         startWsRecorder();
         addWsEvent("恢复上传", "检测到人声，继续发送音频片段");
       }

@@ -37,10 +37,9 @@ import static org.mockito.Mockito.when;
 
 class AudioStreamWebSocketHandlerTest {
     @Test
-    void stopSplitsLongStreamIntoMultipleWindows() throws Exception {
+    void stopFlushesLongStreamAsOneFinalWindow() throws Exception {
         TestFixture fixture = new TestFixture();
         fixture.pipelineResults.put(fixture.audioEventIds.get(0), completedResult(fixture.audioEventIds.get(0), "memory-1"));
-        fixture.pipelineResults.put(fixture.audioEventIds.get(1), completedResult(fixture.audioEventIds.get(1), "memory-2"));
 
         fixture.handler.afterConnectionEstablished(fixture.session);
         fixture.handler.handleTextMessage(fixture.session, new TextMessage("{\"type\":\"session_started\"}"));
@@ -50,19 +49,17 @@ class AudioStreamWebSocketHandlerTest {
         fixture.handler.handleBinaryMessage(fixture.session, new BinaryMessage(chunk()));
         fixture.handler.handleTextMessage(fixture.session, new TextMessage("{\"type\":\"stop\",\"fileName\":\"long-run.webm\"}"));
 
-        assertThat(fixture.windowMetadata).hasSize(2);
+        assertThat(fixture.windowMetadata).hasSize(1);
         assertThat(fixture.windowMetadata.get(0).windowIndex()).isEqualTo(1);
-        assertThat(fixture.windowMetadata.get(0).finalWindow()).isFalse();
-        assertThat(fixture.windowMetadata.get(1).windowIndex()).isEqualTo(2);
-        assertThat(fixture.windowMetadata.get(1).finalWindow()).isTrue();
-        assertThat(fixture.fileNames).containsExactly("browser-stream.part-001.webm", "long-run.final-002.webm");
-        assertThat(fixture.outboundMessages.stream().filter(message -> message.contains("\"type\":\"window_processing_started\"")).count()).isEqualTo(2);
-        assertThat(fixture.outboundMessages.stream().filter(message -> message.contains("\"type\":\"window_processing_completed\"")).count()).isEqualTo(2);
+        assertThat(fixture.windowMetadata.get(0).finalWindow()).isTrue();
+        assertThat(fixture.fileNames).containsExactly("long-run.final-001.webm");
+        assertThat(fixture.outboundMessages.stream().filter(message -> message.contains("\"type\":\"window_processing_started\"")).count()).isEqualTo(1);
+        assertThat(fixture.outboundMessages.stream().filter(message -> message.contains("\"type\":\"window_processing_completed\"")).count()).isEqualTo(1);
         assertThat(fixture.outboundMessages.stream().filter(message -> message.contains("\"type\":\"incremental_transcript\"")).count()).isEqualTo(3);
         assertThat(fixture.outboundMessages.stream().anyMatch(message -> message.contains("\"type\":\"processing_completed\""))).isTrue();
         assertThat(fixture.closeReasons()).contains("manual_stop");
 
-        verify(fixture.audioAnalyzeTaskService, times(2)).submitAudioAnalyzeJob(any(UUID.class));
+        verify(fixture.audioAnalyzeTaskService).submitAudioAnalyzeJob(any(UUID.class));
         verify(fixture.audioAnalyzeTaskService).submitSessionPostProcessingJob(any(UUID.class), anyString());
     }
 
