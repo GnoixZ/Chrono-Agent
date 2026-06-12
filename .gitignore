@@ -13,6 +13,7 @@ node_modules/
 audio-data/
 tmp/
 logs/
+docs/
 .env
 .env.local
 model-service/.env.local
