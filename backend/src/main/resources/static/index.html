@@ -10,7 +10,7 @@
   <header class="topbar">
     <div>
       <h1>Chrono Agent Demo</h1>
-      <p>录音、声纹人物、会话记忆、健康事件和 Agent 召回全流程演示</p>
+      <p>实时流、会话后处理、人物记忆和 Agent 召回全流程演示</p>
     </div>
     <div class="user-strip">
       <label for="userId">User ID</label>
@@ -20,10 +20,62 @@
   </header>
 
   <main class="workspace">
-    <section class="panel capture-panel">
+    <section class="panel lifecycle-panel">
       <div class="panel-title">
         <span>01</span>
-        <h2>音频接入</h2>
+        <h2>实时流和会话生命周期</h2>
+      </div>
+
+      <div class="control-block">
+        <label>WebSocket 实时流</label>
+        <div class="button-row">
+          <button id="wsStartBtn">开始流式录音</button>
+          <button id="wsStopBtn" disabled>停止流并处理</button>
+        </div>
+        <div id="wsStatus" class="status-line">未连接</div>
+        <section id="wsProgress" class="stream-progress" aria-live="polite"></section>
+      </div>
+    </section>
+
+    <section class="panel side-panel">
+      <div class="panel-title">
+        <span>02</span>
+        <h2>人物和记忆</h2>
+      </div>
+      <h3>周围人物</h3>
+      <div id="speakers" class="stack"></div>
+      <h3>候选记忆</h3>
+      <div id="memoryCandidates" class="stack"></div>
+      <h3>长期记忆</h3>
+      <div id="memoryItems" class="stack"></div>
+    </section>
+
+    <section class="panel timeline-panel">
+      <div class="panel-title">
+        <span>03</span>
+        <h2>后处理结果和会话记录</h2>
+      </div>
+      <div id="timeline" class="timeline"></div>
+    </section>
+
+    <section class="panel agent-panel">
+      <div class="panel-title">
+        <span>04</span>
+        <h2>Agent 对话和召回</h2>
+      </div>
+      <div id="chatLog" class="chat-log"></div>
+      <form id="agentForm" class="agent-input">
+        <input id="agentMessage" placeholder="问一下最近状态、人物互动或压力变化">
+        <button type="submit">发送</button>
+      </form>
+      <h3>本次召回上下文</h3>
+      <div id="recallContext" class="recall-grid"></div>
+    </section>
+
+    <section class="panel capture-panel">
+      <div class="panel-title">
+        <span>05</span>
+        <h2>补充数据写入</h2>
       </div>
 
       <form id="uploadForm" class="control-block">
@@ -39,16 +91,6 @@
           <button id="recordStopBtn" disabled>停止并上传</button>
         </div>
         <div id="recordingStatus" class="status-line">未录音</div>
-      </div>
-
-      <div class="control-block">
-        <label>WebSocket 实时流</label>
-        <div class="button-row">
-          <button id="wsStartBtn">开始流式录音</button>
-          <button id="wsStopBtn" disabled>停止流并处理</button>
-        </div>
-        <div id="wsStatus" class="status-line">未连接</div>
-        <section id="wsProgress" class="stream-progress" aria-live="polite"></section>
       </div>
 
       <form id="healthForm" class="control-block">
@@ -69,44 +111,9 @@
       </form>
     </section>
 
-    <section class="panel timeline-panel">
-      <div class="panel-title">
-        <span>02</span>
-        <h2>时间线和会话记录</h2>
-      </div>
-      <div id="timeline" class="timeline"></div>
-    </section>
-
-    <section class="panel side-panel">
-      <div class="panel-title">
-        <span>03</span>
-        <h2>人物和记忆</h2>
-      </div>
-      <h3>周围人物</h3>
-      <div id="speakers" class="stack"></div>
-      <h3>候选记忆</h3>
-      <div id="memoryCandidates" class="stack"></div>
-      <h3>长期记忆</h3>
-      <div id="memoryItems" class="stack"></div>
-    </section>
-
-    <section class="panel agent-panel">
-      <div class="panel-title">
-        <span>04</span>
-        <h2>Agent 对话和召回</h2>
-      </div>
-      <div id="chatLog" class="chat-log"></div>
-      <form id="agentForm" class="agent-input">
-        <input id="agentMessage" placeholder="问一下最近状态、人物互动或压力变化">
-        <button type="submit">发送</button>
-      </form>
-      <h3>本次召回上下文</h3>
-      <div id="recallContext" class="recall-grid"></div>
-    </section>
-
     <section class="panel data-panel">
       <div class="panel-title">
-        <span>05</span>
+        <span>06</span>
         <h2>已存储用户数据</h2>
       </div>
       <div class="tabs" id="dataTabs"></div>

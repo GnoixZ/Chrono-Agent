@@ -23,6 +23,10 @@ public class AudioAnalyzeTaskService {
         return CompletableFuture.supplyAsync(() -> demoPipelineService.processPendingAudio(audioEventId), executor);
     }
 
+    public CompletableFuture<DemoAudioResult> submitSessionPostProcessingJob(UUID streamSessionId, String closeReason) {
+        return CompletableFuture.supplyAsync(() -> demoPipelineService.processStreamSession(streamSessionId, closeReason), executor);
+    }
+
     @PreDestroy
     void shutdown() {
         executor.shutdown();

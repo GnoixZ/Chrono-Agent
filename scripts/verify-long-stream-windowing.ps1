@@ -152,13 +152,16 @@ public static class LongStreamWsClient
                 chunk[index] = 7;
             }
 
+            var startMessage = Encoding.UTF8.GetBytes("{\"type\":\"session_started\"}");
+            socket.SendAsync(new ArraySegment<byte>(startMessage), WebSocketMessageType.Text, true, CancellationToken.None).GetAwaiter().GetResult();
+
             for (var i = 0; i < chunkIterations; i++)
             {
                 socket.SendAsync(new ArraySegment<byte>(chunk), WebSocketMessageType.Binary, true, CancellationToken.None).GetAwaiter().GetResult();
                 Thread.Sleep(chunkIntervalMs);
             }
 
-            var stopMessage = Encoding.UTF8.GetBytes("{\"type\":\"stop\",\"fileName\":\"long-stream-verify.webm\"}");
+            var stopMessage = Encoding.UTF8.GetBytes("{\"type\":\"stop\",\"fileName\":\"long-stream-verify.webm\",\"reason\":\"manual_stop\"}");
             socket.SendAsync(new ArraySegment<byte>(stopMessage), WebSocketMessageType.Text, true, CancellationToken.None).GetAwaiter().GetResult();
 
             var completed = receiveTask.Wait(TimeSpan.FromSeconds(closeTimeoutSeconds));
@@ -213,21 +216,27 @@ $state = $null
 $streamSession = $null
 $audioEvents = @()
 $modelJobs = @()
+$conversationMemories = @()
 
 while ((Get-Date) -lt $deadline) {
     $state = Invoke-RestMethod -Uri $stateUrl -Method Get
     $streamSession = @($state.audioStreamSessions)[0]
     $audioEvents = @($state.audioEvents)
     $modelJobs = @($state.modelJobs)
+    $conversationMemories = @($state.conversationMemories)
 
     $sessionWindowCount = To-Int (Get-JsonValue $streamSession "windowCount")
     $processedWindowCount = To-Int (Get-JsonValue $streamSession "processedWindowCount")
     $failedWindowCount = To-Int (Get-JsonValue $streamSession "failedWindowCount")
+    $postProcessingStatus = [string](Get-JsonValue $streamSession "sessionPostProcessingStatus")
+    $sessionConversationMemoryId = [string](Get-JsonValue $streamSession "sessionConversationMemoryId")
 
     if ($null -ne $streamSession -and
         $sessionWindowCount -ge $expectedWindows -and
         $processedWindowCount -ge $expectedWindows -and
         $failedWindowCount -eq 0 -and
+        $postProcessingStatus -eq "completed" -and
+        -not [string]::IsNullOrWhiteSpace($sessionConversationMemoryId) -and
         $audioEvents.Count -ge $expectedWindows -and
         $modelJobs.Count -ge $expectedWindows) {
         break
@@ -243,12 +252,18 @@ $sessionWindowCount = To-Int (Get-JsonValue $streamSession "windowCount")
 $processedWindowCount = To-Int (Get-JsonValue $streamSession "processedWindowCount")
 $failedWindowCount = To-Int (Get-JsonValue $streamSession "failedWindowCount")
 $closeReason = [string](Get-JsonValue $streamSession "closeReason")
+$businessSessionStatus = [string](Get-JsonValue $streamSession "sessionStatus")
+$postProcessingStatus = [string](Get-JsonValue $streamSession "sessionPostProcessingStatus")
+$sessionConversationMemoryId = [string](Get-JsonValue $streamSession "sessionConversationMemoryId")
 
 Assert-Condition ($sessionStatus -eq "closed") "Stream session is not closed. status=$sessionStatus"
+Assert-Condition ($businessSessionStatus -eq "closed") "Business session is not closed. session_status=$businessSessionStatus"
 Assert-Condition ($sessionWindowCount -eq $expectedWindows) "Unexpected window count. expected=$expectedWindows actual=$sessionWindowCount"
 Assert-Condition ($processedWindowCount -eq $expectedWindows) "Unexpected processed window count. expected=$expectedWindows actual=$processedWindowCount"
 Assert-Condition ($failedWindowCount -eq 0) "Failed windows detected. failed_window_count=$failedWindowCount"
-Assert-Condition ($closeReason -eq "client_stop") "Unexpected stream close reason: $closeReason"
+Assert-Condition ($closeReason -eq "manual_stop") "Unexpected stream close reason: $closeReason"
+Assert-Condition ($postProcessingStatus -eq "completed") "Unexpected session post-processing status: $postProcessingStatus"
+Assert-Condition (-not [string]::IsNullOrWhiteSpace($sessionConversationMemoryId)) "No session-level conversation memory was linked."
 Assert-Condition ($audioEvents.Count -eq $expectedWindows) "Unexpected audio_event count. expected=$expectedWindows actual=$($audioEvents.Count)"
 Assert-Condition ($modelJobs.Count -eq $expectedWindows) "Unexpected model_job count. expected=$expectedWindows actual=$($modelJobs.Count)"
 
@@ -264,18 +279,30 @@ Assert-Condition ($unfinishedEvents.Count -eq 0) "Unfinished audio_event records
 Assert-Condition ($incompleteJobs.Count -eq 0) "Incomplete model_job records detected: $($incompleteJobs | ConvertTo-Json -Depth 4 -Compress)"
 
 $streamOpenedCount = Get-EventCount $eventList "stream_opened"
+$sessionStartedCount = Get-EventCount $eventList "session_started"
+$transcriptCount = Get-EventCount $eventList "incremental_transcript"
 $windowStartedCount = Get-EventCount $eventList "window_processing_started"
 $windowCompletedCount = Get-EventCount $eventList "window_processing_completed"
 $processingStartedCount = Get-EventCount $eventList "processing_started"
+$sessionPostProcessingStartedCount = Get-EventCount $eventList "session_post_processing_started"
 $processingCompletedCount = Get-EventCount $eventList "processing_completed"
 $errorEventCount = Get-EventCount $eventList "error"
 
 Assert-Condition ($streamOpenedCount -eq 1) "Unexpected stream_opened count: $streamOpenedCount"
+Assert-Condition ($sessionStartedCount -eq 1) "Unexpected session_started count: $sessionStartedCount"
+Assert-Condition ($transcriptCount -ge 1) "No incremental transcript events were observed."
 Assert-Condition ($windowStartedCount -eq $expectedWindows) "Unexpected window_processing_started count. expected=$expectedWindows actual=$windowStartedCount"
 Assert-Condition ($windowCompletedCount -eq $expectedWindows) "Unexpected window_processing_completed count. expected=$expectedWindows actual=$windowCompletedCount"
-Assert-Condition ($processingStartedCount -eq 1) "Unexpected processing_started count: $processingStartedCount"
+Assert-Condition ($processingStartedCount -le 1) "Unexpected processing_started count: $processingStartedCount"
+Assert-Condition ($sessionPostProcessingStartedCount -eq 1) "Unexpected session_post_processing_started count: $sessionPostProcessingStartedCount"
 Assert-Condition ($processingCompletedCount -eq 1) "Unexpected processing_completed count: $processingCompletedCount"
 Assert-Condition ($errorEventCount -eq 0) "WebSocket error events detected. count=$errorEventCount"
+
+$sessionLevelMemories = @($conversationMemories | Where-Object {
+    [string](Get-JsonValue $_ "sourceType") -eq "audio_session" -and
+    [string](Get-JsonValue $_ "id") -eq $sessionConversationMemoryId
+})
+Assert-Condition ($sessionLevelMemories.Count -eq 1) "Session-level conversation memory was not visible in state."
 
 $audioEventStatuses = @($audioEvents | ForEach-Object { [string](Get-JsonValue $_ "processingStatus") })
 $modelJobStatuses = @($modelJobs | ForEach-Object { [string](Get-JsonValue $_ "status") })
@@ -284,6 +311,7 @@ Write-Host ""
 Write-Host "Long stream verification passed"
 Write-Host "UserId: $UserId"
 Write-Host "StreamSessionId: $(Get-JsonValue $streamSession 'id')"
+Write-Host "SessionConversationMemoryId: $sessionConversationMemoryId"
 Write-Host "WindowCount: $sessionWindowCount"
 Write-Host "ProcessedWindowCount: $processedWindowCount"
 Write-Host "FailedWindowCount: $failedWindowCount"
@@ -291,4 +319,5 @@ Write-Host "AudioEventStatuses: $($audioEventStatuses -join ', ')"
 Write-Host "ModelJobStatuses: $($modelJobStatuses -join ', ')"
 Write-Host "WS window_processing_started: $windowStartedCount"
 Write-Host "WS window_processing_completed: $windowCompletedCount"
+Write-Host "WS incremental_transcript: $transcriptCount"
 Write-Host "WS processing_completed: $processingCompletedCount"

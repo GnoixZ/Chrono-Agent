@@ -1,5 +1,5 @@
 from app.providers.fake import FakeModelProvider
-from app.schemas import AnalyzeAudioRequest, AnalyzeAudioResponse
+from app.schemas import AnalyzeAudioRequest, AnalyzeAudioResponse, IncrementalTranscriptRequest, IncrementalTranscriptResponse
 
 
 class AnalyzeAudioService:
@@ -8,3 +8,6 @@ class AnalyzeAudioService:
 
     def analyze(self, request: AnalyzeAudioRequest) -> AnalyzeAudioResponse:
         return self.provider.analyze_audio(request)
+
+    def incremental_transcript(self, request: IncrementalTranscriptRequest) -> IncrementalTranscriptResponse:
+        return self.provider.incremental_transcript(request)

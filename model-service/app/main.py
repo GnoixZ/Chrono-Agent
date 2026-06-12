@@ -9,6 +9,8 @@ from app.schemas import (
     AgentReplyResponse,
     AnalyzeAudioRequest,
     AnalyzeAudioResponse,
+    IncrementalTranscriptRequest,
+    IncrementalTranscriptResponse,
     VectorSearchRequest,
     VectorSearchResponse,
     VectorUpsertRequest,
@@ -34,6 +36,11 @@ def health() -> dict[str, str]:
 @app.post("/v1/audio/analyze", response_model=AnalyzeAudioResponse)
 def analyze_audio(request: AnalyzeAudioRequest) -> AnalyzeAudioResponse:
     return audio_service.analyze(request)
+
+
+@app.post("/v1/audio/transcript", response_model=IncrementalTranscriptResponse)
+def incremental_transcript(request: IncrementalTranscriptRequest) -> IncrementalTranscriptResponse:
+    return audio_service.incremental_transcript(request)
 
 
 @app.post("/v1/agent/reply", response_model=AgentReplyResponse)

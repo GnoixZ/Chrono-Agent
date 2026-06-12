@@ -44,3 +44,26 @@ def test_analyze_audio_discards_blank_audio() -> None:
 
     assert response.status_code == 200
     assert response.json()["summary"]["discard"] is True
+
+
+def test_incremental_transcript_returns_deterministic_chunk_text() -> None:
+    client = TestClient(app)
+
+    response = client.post(
+        "/v1/audio/transcript",
+        json={
+            "request_id": "req-transcript-1",
+            "user_id": "user-1",
+            "stream_session_id": "stream-1",
+            "chunk_index": 3,
+            "chunk_bytes": 2048,
+            "is_final": False,
+        },
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["stream_session_id"] == "stream-1"
+    assert body["sequence"] == 3
+    assert body["transcript"] == "实时片段 3: 已接收约 2048 字节音频。"
+    assert body["is_final"] is False

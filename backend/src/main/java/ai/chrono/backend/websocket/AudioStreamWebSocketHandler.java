@@ -2,6 +2,9 @@ package ai.chrono.backend.websocket;
 
 import ai.chrono.backend.demo.DemoAudioResult;
 import ai.chrono.backend.demo.DemoPipelineService;
+import ai.chrono.backend.modelclient.ModelServiceClient;
+import ai.chrono.backend.modelclient.dto.IncrementalTranscriptRequest;
+import ai.chrono.backend.modelclient.dto.IncrementalTranscriptResponse;
 import ai.chrono.backend.task.AudioAnalyzeTaskService;
 import com.alibaba.fastjson2.JSONObject;
 import org.springframework.jdbc.core.JdbcTemplate;
@@ -30,20 +33,29 @@ public class AudioStreamWebSocketHandler extends BinaryWebSocketHandler {
     private static final Duration WINDOW_DURATION = Duration.ofSeconds(30);
     private static final Duration MIN_DISCONNECT_TAIL_DURATION = Duration.ofSeconds(3);
     private static final String DEFAULT_STREAM_FILE_NAME = "browser-stream.webm";
+    private static final String SESSION_STATUS_LISTENING = "listening";
+    private static final String SESSION_STATUS_IN_SESSION = "in_session";
+    private static final String SESSION_STATUS_POST_PROCESSING = "post_processing";
+    private static final String SESSION_STATUS_CLOSED = "closed";
+    private static final String CLOSE_REASON_MANUAL_STOP = "manual_stop";
+    private static final String CLOSE_REASON_LISTENING_STOPPED = "listening_stopped";
 
     private final JdbcTemplate jdbc;
     private final DemoPipelineService demoPipelineService;
     private final AudioAnalyzeTaskService audioAnalyzeTaskService;
+    private final ModelServiceClient modelServiceClient;
     private final ConcurrentMap<String, StreamState> streams = new ConcurrentHashMap<>();
 
     public AudioStreamWebSocketHandler(
             JdbcTemplate jdbc,
             DemoPipelineService demoPipelineService,
-            AudioAnalyzeTaskService audioAnalyzeTaskService
+            AudioAnalyzeTaskService audioAnalyzeTaskService,
+            ModelServiceClient modelServiceClient
     ) {
         this.jdbc = jdbc;
         this.demoPipelineService = demoPipelineService;
         this.audioAnalyzeTaskService = audioAnalyzeTaskService;
+        this.modelServiceClient = modelServiceClient;
     }
 
     @Override
@@ -73,8 +85,8 @@ public class AudioStreamWebSocketHandler extends BinaryWebSocketHandler {
 
         streams.put(session.getId(), new StreamState(userId, streamSessionId, now));
         send(session, """
-                {"type":"stream_opened","streamSessionId":"%s","userId":"%s"}
-                """.formatted(streamSessionId, escape(userId)).trim());
+                {"type":"stream_opened","streamSessionId":"%s","userId":"%s","sessionState":"%s","listeningStartedAt":"%s"}
+                """.formatted(streamSessionId, escape(userId), SESSION_STATUS_LISTENING, now).trim());
     }
 
     @Override
@@ -84,9 +96,18 @@ public class AudioStreamWebSocketHandler extends BinaryWebSocketHandler {
 
     @Override
     protected void handleTextMessage(WebSocketSession session, TextMessage message) {
-        String payload = message.getPayload();
-        if (payload != null && payload.contains("\"stop\"")) {
-            stop(session, fileNameFromControl(payload));
+        JSONObject payload = parseControlMessage(message.getPayload());
+        String type = payload.getString("type");
+        if ("session_started".equals(type)) {
+            startSession(session);
+            return;
+        }
+        if ("close_listening".equals(type)) {
+            stopListening(session);
+            return;
+        }
+        if ("stop".equals(type)) {
+            stop(session, payload.getString("fileName"), payload.getString("reason"));
             return;
         }
         send(session, "{\"type\":\"error\",\"message\":\"unsupported control message\"}");
@@ -110,6 +131,7 @@ public class AudioStreamWebSocketHandler extends BinaryWebSocketHandler {
         } catch (RuntimeException error) {
             closeReason = "processing_failed:" + trimReason(error.getMessage());
         }
+        updateSessionStatus(state, SESSION_STATUS_CLOSED, null);
         closeStream(state, closeReason, latestAudioEventId);
     }
 
@@ -117,6 +139,10 @@ public class AudioStreamWebSocketHandler extends BinaryWebSocketHandler {
         StreamState state = streams.get(session.getId());
         if (state == null) {
             send(session, "{\"type\":\"error\",\"message\":\"stream state not found\"}");
+            return;
+        }
+        if (!state.isSessionStarted()) {
+            send(session, "{\"type\":\"error\",\"message\":\"session is not started\"}");
             return;
         }
         byte[] bytes = new byte[buffer.remaining()];
@@ -132,6 +158,7 @@ public class AudioStreamWebSocketHandler extends BinaryWebSocketHandler {
         send(session, """
                 {"type":"chunk_received","chunks":%d,"bytes":%d}
                 """.formatted(state.totalChunks(), state.totalBytes()).trim());
+        sendIncrementalTranscript(session, state, bytes.length);
 
         if (state.currentWindowDuration(Instant.now()).compareTo(WINDOW_DURATION) < 0) {
             return;
@@ -140,6 +167,7 @@ public class AudioStreamWebSocketHandler extends BinaryWebSocketHandler {
         try {
             flushWindow(session, session.getId(), state, DEFAULT_STREAM_FILE_NAME, false);
         } catch (RuntimeException error) {
+            updateSessionStatus(state, SESSION_STATUS_CLOSED, null);
             closeStream(state, "processing_failed", parseUuid(state.lastAudioEventId()));
             streams.remove(session.getId());
             send(session, """
@@ -149,7 +177,7 @@ public class AudioStreamWebSocketHandler extends BinaryWebSocketHandler {
         }
     }
 
-    private void stop(WebSocketSession session, String fileName) {
+    private void stop(WebSocketSession session, String fileName, String reason) {
         StreamState state = streams.get(session.getId());
         if (state == null) {
             send(session, "{\"type\":\"error\",\"message\":\"stream state not found\"}");
@@ -157,27 +185,37 @@ public class AudioStreamWebSocketHandler extends BinaryWebSocketHandler {
             return;
         }
         String resolvedFileName = fileName == null || fileName.isBlank() ? DEFAULT_STREAM_FILE_NAME : fileName;
+        String closeReason = reason == null || reason.isBlank() ? CLOSE_REASON_MANUAL_STOP : trimReason(reason);
         try {
+            if (!state.isSessionStarted() && !state.hasQueuedWindows() && !state.hasBufferedAudio()) {
+                stopListening(session);
+                return;
+            }
             if (state.hasBufferedAudio()) {
                 flushWindow(session, session.getId(), state, resolvedFileName, true);
             } else if (!state.hasQueuedWindows()) {
                 send(session, "{\"type\":\"error\",\"message\":\"no audio chunks received\"}");
+                updateSessionStatus(state, SESSION_STATUS_CLOSED, null);
                 closeStream(state, "empty_audio", null);
                 streams.remove(session.getId());
                 close(session, "empty audio");
                 return;
             }
-            state.markStopRequested();
+            state.markStopRequested(closeReason);
+            updateSessionStatus(state, SESSION_STATUS_POST_PROCESSING, null);
             if (state.hasPendingTasks()) {
                 send(session, """
-                        {"type":"processing_started","audioEventId":"%s","pendingWindows":%d}
+                        {"type":"processing_started","audioEventId":"%s","pendingWindows":%d,"sessionState":"%s","closeReason":"%s"}
                         """.formatted(
                         escape(nullToEmpty(state.lastAudioEventId())),
-                        state.pendingTasks()).trim());
+                        state.pendingTasks(),
+                        SESSION_STATUS_POST_PROCESSING,
+                        escape(closeReason)).trim());
                 return;
             }
             finishStop(session, state);
         } catch (RuntimeException error) {
+            updateSessionStatus(state, SESSION_STATUS_CLOSED, null);
             closeStream(state, "processing_failed", parseUuid(state.lastAudioEventId()));
             streams.remove(session.getId());
             send(session, """
@@ -185,6 +223,34 @@ public class AudioStreamWebSocketHandler extends BinaryWebSocketHandler {
                     """.formatted(escape(error.getMessage())).trim());
             close(session, "processing failed");
         }
+    }
+
+    private void startSession(WebSocketSession session) {
+        StreamState state = streams.get(session.getId());
+        if (state == null || state.isSessionStarted()) {
+            return;
+        }
+        Instant now = Instant.now();
+        updateSessionStatus(state, SESSION_STATUS_IN_SESSION, now);
+        send(session, """
+                {"type":"session_started","streamSessionId":"%s","sessionState":"%s","sessionStartedAt":"%s"}
+                """.formatted(state.streamSessionId(), SESSION_STATUS_IN_SESSION, now).trim());
+    }
+
+    private void stopListening(WebSocketSession session) {
+        StreamState state = streams.get(session.getId());
+        if (state == null) {
+            send(session, "{\"type\":\"error\",\"message\":\"stream state not found\"}");
+            close(session, "stream state missing");
+            return;
+        }
+        updateSessionStatus(state, SESSION_STATUS_CLOSED, null);
+        closeStream(state, CLOSE_REASON_LISTENING_STOPPED, null);
+        streams.remove(session.getId(), state);
+        send(session, """
+                {"type":"listening_stopped","streamSessionId":"%s","sessionState":"%s"}
+                """.formatted(state.streamSessionId(), SESSION_STATUS_CLOSED).trim());
+        close(session, "listening stopped");
     }
 
     private void flushWindow(WebSocketSession session, String sessionKey, StreamState state, String fileName, boolean finalWindow) {
@@ -222,6 +288,31 @@ public class AudioStreamWebSocketHandler extends BinaryWebSocketHandler {
         UUID audioEventId = UUID.fromString(pendingAudioAnalysis.audioEventId());
         audioAnalyzeTaskService.submitAudioAnalyzeJob(audioEventId)
                 .whenComplete((result, error) -> onWindowAnalysisFinished(session, sessionKey, state.streamSessionId(), audioEventId, result, error));
+    }
+
+    private void sendIncrementalTranscript(WebSocketSession session, StreamState state, int chunkBytes) {
+        try {
+            IncrementalTranscriptResponse response = modelServiceClient.incrementalTranscript(new IncrementalTranscriptRequest(
+                    UUID.randomUUID().toString(),
+                    state.userId(),
+                    state.streamSessionId().toString(),
+                    state.totalChunks(),
+                    chunkBytes,
+                    false
+            ));
+            send(session, """
+                    {"type":"incremental_transcript","streamSessionId":"%s","sequence":%d,"transcript":"%s","stability":%s,"isFinal":%s}
+                    """.formatted(
+                    escape(nullToEmpty(response.streamSessionId())),
+                    response.sequence() == null ? state.totalChunks() : response.sequence(),
+                    escape(nullToEmpty(response.transcript())),
+                    response.stability() == null ? "0.0" : response.stability().toString(),
+                    Boolean.TRUE.equals(response.isFinal())).trim());
+        } catch (RuntimeException error) {
+            send(session, """
+                    {"type":"transcript_error","message":"%s"}
+                    """.formatted(escape(trimReason(error.getMessage()))).trim());
+        }
     }
 
     private void onWindowAnalysisFinished(
@@ -264,15 +355,55 @@ public class AudioStreamWebSocketHandler extends BinaryWebSocketHandler {
     }
 
     private void finishStop(WebSocketSession session, StreamState state) {
-        closeStream(state, "client_stop", parseUuid(state.lastAudioEventId()));
+        if (!state.markSessionPostProcessingStarted()) {
+            return;
+        }
+        updateSessionStatus(state, SESSION_STATUS_POST_PROCESSING, null);
+        closeStream(state, state.closeReason(), parseUuid(state.lastAudioEventId()));
+        send(session, """
+                {"type":"session_post_processing_started","streamSessionId":"%s","audioEventId":"%s","sessionState":"%s","closeReason":"%s"}
+                """.formatted(
+                state.streamSessionId(),
+                escape(nullToEmpty(state.lastAudioEventId())),
+                SESSION_STATUS_POST_PROCESSING,
+                escape(state.closeReason())).trim());
+        audioAnalyzeTaskService.submitSessionPostProcessingJob(state.streamSessionId(), state.closeReason())
+                .whenComplete((result, error) -> onSessionPostProcessingFinished(session, state, result, error));
+    }
+
+    private void onSessionPostProcessingFinished(WebSocketSession session, StreamState state, DemoAudioResult result, Throwable error) {
+        if (error != null || result == null) {
+            markSessionPostProcessingFailed(state.streamSessionId(), error);
+            streams.remove(session.getId(), state);
+            send(session, """
+                    {"type":"processing_completed","audioEventId":"%s","conversationMemoryId":"","processingStatus":"failed","sessionState":"%s","closeReason":"%s"}
+                    """.formatted(
+                    escape(nullToEmpty(state.lastAudioEventId())),
+                    SESSION_STATUS_CLOSED,
+                    escape(state.closeReason())).trim());
+            close(session, "completed with post-processing failure");
+            return;
+        }
+        state.markSessionPostProcessed(result);
         streams.remove(session.getId(), state);
         send(session, """
-                {"type":"processing_completed","audioEventId":"%s","conversationMemoryId":"%s","processingStatus":"%s"}
+                {"type":"processing_completed","audioEventId":"%s","conversationMemoryId":"%s","processingStatus":"%s","sessionState":"%s","closeReason":"%s"}
                 """.formatted(
-                escape(nullToEmpty(state.lastAudioEventId())),
-                escape(nullToEmpty(state.lastConversationMemoryId())),
-                escape(nullToEmpty(state.lastProcessingStatus()))).trim());
+                escape(nullToEmpty(result.audioEventId())),
+                escape(nullToEmpty(result.conversationMemoryId())),
+                escape(nullToEmpty(result.processingStatus())),
+                SESSION_STATUS_CLOSED,
+                escape(state.closeReason())).trim());
         close(session, "completed");
+    }
+
+    private void markSessionPostProcessingFailed(UUID streamSessionId, Throwable error) {
+        jdbc.update("""
+                        update audio_stream_session
+                        set session_post_processing_status = ?, session_status = ?, updated_at = ?
+                        where id = ?
+                        """,
+                "failed", SESSION_STATUS_CLOSED, Timestamp.from(Instant.now()), streamSessionId);
     }
 
     private void closeStream(StreamState state, String reason, UUID audioEventId) {
@@ -281,11 +412,35 @@ public class AudioStreamWebSocketHandler extends BinaryWebSocketHandler {
         }
         jdbc.update("""
                         update audio_stream_session
-                        set status = ?, close_reason = ?, closed_at = ?, current_audio_event_id = ?, updated_at = ?
+                        set status = ?, close_reason = ?, session_close_reason = ?, closed_at = ?, session_ended_at = ?,
+                            current_audio_event_id = ?, updated_at = ?
                         where id = ?
                         """,
-                "closed", reason, Timestamp.from(Instant.now()), audioEventId, Timestamp.from(Instant.now()), state.streamSessionId());
+                "closed", reason, reason, Timestamp.from(Instant.now()), Timestamp.from(Instant.now()),
+                audioEventId, Timestamp.from(Instant.now()), state.streamSessionId());
         state.markClosedPersisted();
+    }
+
+    private void updateSessionStatus(StreamState state, String sessionStatus, Instant sessionStartedAt) {
+        if (state == null) {
+            return;
+        }
+        state.markSessionStatus(sessionStatus, sessionStartedAt);
+        if (sessionStartedAt != null) {
+            jdbc.update("""
+                            update audio_stream_session
+                            set session_status = ?, session_started_at = ?, updated_at = ?
+                            where id = ?
+                            """,
+                    sessionStatus, Timestamp.from(sessionStartedAt), Timestamp.from(Instant.now()), state.streamSessionId());
+            return;
+        }
+        jdbc.update("""
+                        update audio_stream_session
+                        set session_status = ?, updated_at = ?
+                        where id = ?
+                        """,
+                sessionStatus, Timestamp.from(Instant.now()), state.streamSessionId());
     }
 
     private void enqueueWindow(UUID streamSessionId, String audioEventId) {
@@ -358,12 +513,12 @@ public class AudioStreamWebSocketHandler extends BinaryWebSocketHandler {
         return null;
     }
 
-    private static String fileNameFromControl(String message) {
+    private static JSONObject parseControlMessage(String message) {
         try {
             JSONObject object = JSONObject.parseObject(message);
-            return object.getString("fileName");
+            return object == null ? new JSONObject() : object;
         } catch (RuntimeException error) {
-            return DEFAULT_STREAM_FILE_NAME;
+            return new JSONObject();
         }
     }
 
@@ -429,6 +584,10 @@ public class AudioStreamWebSocketHandler extends BinaryWebSocketHandler {
         private int queuedWindows;
         private int pendingTasks;
         private boolean stopRequested;
+        private boolean sessionPostProcessingStarted;
+        private String closeReason = CLOSE_REASON_MANUAL_STOP;
+        private Instant sessionStartedAt;
+        private String sessionStatus = SESSION_STATUS_LISTENING;
         private String lastAudioEventId;
         private String lastConversationMemoryId;
         private String lastProcessingStatus;
@@ -534,8 +693,38 @@ public class AudioStreamWebSocketHandler extends BinaryWebSocketHandler {
             return stopRequested && pendingTasks == 0;
         }
 
-        synchronized void markStopRequested() {
+        synchronized void markStopRequested(String reason) {
             stopRequested = true;
+            closeReason = reason == null || reason.isBlank() ? CLOSE_REASON_MANUAL_STOP : reason;
+        }
+
+        synchronized String closeReason() {
+            return closeReason;
+        }
+
+        synchronized boolean markSessionPostProcessingStarted() {
+            if (sessionPostProcessingStarted) {
+                return false;
+            }
+            sessionPostProcessingStarted = true;
+            return true;
+        }
+
+        synchronized void markSessionPostProcessed(DemoAudioResult result) {
+            lastAudioEventId = result.audioEventId();
+            lastConversationMemoryId = result.conversationMemoryId();
+            lastProcessingStatus = result.processingStatus();
+        }
+
+        synchronized boolean isSessionStarted() {
+            return sessionStartedAt != null;
+        }
+
+        synchronized void markSessionStatus(String nextSessionStatus, Instant startedAt) {
+            sessionStatus = nextSessionStatus;
+            if (startedAt != null && sessionStartedAt == null) {
+                sessionStartedAt = startedAt;
+            }
         }
 
         synchronized boolean isClosedPersisted() {

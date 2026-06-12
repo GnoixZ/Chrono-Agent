@@ -6,6 +6,13 @@ const state = {
   ws: null,
   wsRecorder: null,
   wsStream: null,
+  wsAudioContext: null,
+  wsAnalyser: null,
+  wsSourceNode: null,
+  wsVadFrameId: null,
+  wsSpeechSince: null,
+  wsSilenceSince: null,
+  wsLastVadUiUpdate: 0,
   sessionId: null,
   lastRecall: [],
   wsProgress: createWsProgressState()
@@ -31,6 +38,11 @@ const keys = [
 
 const $ = (id) => document.getElementById(id);
 
+const WS_AUDIO_TIMESLICE_MS = 1000;
+const WS_VAD_SPEECH_THRESHOLD = 0.035;
+const WS_VAD_SPEECH_HOLD_MS = 1200;
+const WS_VAD_SILENCE_TIMEOUT_MS = 60000;
+
 function userId() {
   return $("userId").value.trim() || "demo-user";
 }
@@ -47,10 +59,18 @@ function createWsProgressState() {
     connected: false,
     streamSessionId: null,
     streamOpenedAt: null,
+    listeningStartedAt: null,
+    sessionStartedAt: null,
+    sessionState: "idle",
+    sessionStartRequested: false,
+    silenceMs: 0,
+    silenceTimeoutMs: WS_VAD_SILENCE_TIMEOUT_MS,
+    latestRms: 0,
+    closeReason: null,
     stopRequested: false,
     phase: "idle",
     headline: "等待开始流式录音",
-    detail: "这里会实时展示窗口切分、排队和处理进度。",
+    detail: "这里会实时展示监听、人声触发、窗口切分和处理进度。",
     chunkCount: 0,
     totalBytes: 0,
     queuedWindows: 0,
@@ -62,6 +82,7 @@ function createWsProgressState() {
     lastConversationMemoryId: null,
     lastProcessingStatus: null,
     windows: [],
+    transcripts: [],
     events: []
   };
 }
@@ -87,6 +108,184 @@ function setWsHeadline(phase, headline, detail) {
   state.wsProgress.phase = phase;
   state.wsProgress.headline = headline;
   state.wsProgress.detail = detail;
+}
+
+function setListeningHeadline(detail) {
+  setWsHeadline(
+    "listening",
+    "流会话已建立，正在监听连续人声",
+    detail || "连接已建立，本地检测到连续人声后才会开始业务会话。"
+  );
+}
+
+function wsConversationStarted() {
+  return Boolean(state.wsProgress.sessionStartedAt);
+}
+
+function stopWsVadLoop() {
+  if (state.wsVadFrameId) {
+    cancelAnimationFrame(state.wsVadFrameId);
+    state.wsVadFrameId = null;
+  }
+  state.wsSpeechSince = null;
+  state.wsSilenceSince = null;
+  state.wsLastVadUiUpdate = 0;
+}
+
+function cleanupWsAudioGraph() {
+  stopWsVadLoop();
+  state.wsSourceNode?.disconnect();
+  state.wsAnalyser?.disconnect?.();
+  state.wsSourceNode = null;
+  state.wsAnalyser = null;
+  if (state.wsAudioContext) {
+    state.wsAudioContext.close().catch(() => {});
+    state.wsAudioContext = null;
+  }
+}
+
+function cleanupWsMedia() {
+  if (state.wsRecorder && state.wsRecorder.state !== "inactive") {
+    state.wsRecorder.stop();
+  }
+  state.wsRecorder = null;
+  cleanupWsAudioGraph();
+  state.wsStream?.getTracks().forEach(track => track.stop());
+  state.wsStream = null;
+}
+
+function startWsRecorder() {
+  if (!state.wsStream) {
+    return;
+  }
+  if (state.wsRecorder && state.wsRecorder.state !== "inactive") {
+    return;
+  }
+  state.wsRecorder = new MediaRecorder(state.wsStream);
+  state.wsRecorder.ondataavailable = async event => {
+    if (event.data.size > 0 && state.ws?.readyState === WebSocket.OPEN) {
+      state.ws.send(await event.data.arrayBuffer());
+    }
+  };
+  state.wsRecorder.start(WS_AUDIO_TIMESLICE_MS);
+}
+
+function triggerWsSessionStart() {
+  if (!state.ws || state.ws.readyState !== WebSocket.OPEN) {
+    return;
+  }
+  if (state.wsProgress.sessionStartRequested || wsConversationStarted()) {
+    return;
+  }
+  state.wsProgress.sessionStartRequested = true;
+  state.ws.send(JSON.stringify({ type: "session_started" }));
+  $("wsStatus").textContent = "检测到连续人声，正在启动业务会话";
+  setWsHeadline("capturing", "检测到连续人声，正在启动业务会话", "已发送 session_started 控制消息，等待服务端确认后开始上传音频片段。");
+  addWsEvent("触发人声", "已发送 session_started");
+  renderWsProgress();
+}
+
+function stopWebSocketSession(reason, detail) {
+  if (state.wsProgress.stopRequested) {
+    return;
+  }
+  if (state.wsRecorder && state.wsRecorder.state !== "inactive") {
+    state.wsRecorder.stop();
+  }
+  stopWsVadLoop();
+  state.wsProgress.stopRequested = true;
+  state.wsProgress.sessionState = "post_processing";
+  state.wsProgress.silenceMs = reason === "silence_timeout_60s" ? WS_VAD_SILENCE_TIMEOUT_MS : state.wsProgress.silenceMs;
+  if (state.ws?.readyState === WebSocket.OPEN) {
+    state.ws.send(JSON.stringify({ type: "stop", fileName: "browser-stream.webm", reason }));
+    $("wsStatus").textContent = detail;
+    setWsHeadline("draining", detail, "前端不再继续采集，后台正在处理剩余窗口。");
+    addWsEvent(reason === "silence_timeout_60s" ? "静音自动结束" : "强制结束", reason);
+    renderWsProgress();
+  }
+}
+
+function startWsVadLoop() {
+  if (!state.wsStream) {
+    return;
+  }
+  cleanupWsAudioGraph();
+  state.wsAudioContext = new AudioContext();
+  state.wsSourceNode = state.wsAudioContext.createMediaStreamSource(state.wsStream);
+  state.wsAnalyser = state.wsAudioContext.createAnalyser();
+  state.wsAnalyser.fftSize = 2048;
+  state.wsAnalyser.smoothingTimeConstant = 0.85;
+  state.wsSourceNode.connect(state.wsAnalyser);
+  const samples = new Uint8Array(state.wsAnalyser.fftSize);
+  const loop = () => {
+    if (!state.wsAnalyser || state.ws?.readyState !== WebSocket.OPEN || state.wsProgress.stopRequested) {
+      state.wsVadFrameId = null;
+      return;
+    }
+    state.wsAnalyser.getByteTimeDomainData(samples);
+    let energy = 0;
+    for (const sample of samples) {
+      const normalized = (sample - 128) / 128;
+      energy += normalized * normalized;
+    }
+    const rms = Math.sqrt(energy / samples.length);
+    const now = performance.now();
+    state.wsProgress.latestRms = rms;
+    if (!wsConversationStarted()) {
+      if (rms >= WS_VAD_SPEECH_THRESHOLD) {
+        if (state.wsSpeechSince == null) {
+          state.wsSpeechSince = now;
+          setListeningHeadline(`检测到人声，保持连续说话约 ${(WS_VAD_SPEECH_HOLD_MS / 1000).toFixed(1)} 秒后开始业务会话。`);
+          renderWsProgress();
+        }
+        if (now - state.wsSpeechSince >= WS_VAD_SPEECH_HOLD_MS) {
+          triggerWsSessionStart();
+        }
+      } else if (state.wsSpeechSince != null) {
+        state.wsSpeechSince = null;
+        if (!state.wsProgress.sessionStartRequested) {
+          setListeningHeadline("刚才的人声未达到连续阈值，继续等待新的说话片段。");
+          renderWsProgress();
+        }
+      }
+      state.wsVadFrameId = requestAnimationFrame(loop);
+      return;
+    }
+
+    if (rms >= WS_VAD_SPEECH_THRESHOLD) {
+      if (state.wsSilenceSince != null) {
+        addWsEvent("恢复人声", "静音计时已清零");
+      }
+      state.wsSilenceSince = null;
+      state.wsProgress.silenceMs = 0;
+      if (state.wsSpeechSince == null) {
+        state.wsSpeechSince = now;
+      }
+    } else {
+      state.wsSpeechSince = null;
+      if (state.wsSilenceSince == null) {
+        state.wsSilenceSince = now;
+        addWsEvent("开始静音", "累计 60 秒后自动结束会话");
+      }
+      state.wsProgress.silenceMs = Math.max(0, now - state.wsSilenceSince);
+      const remainingMs = Math.max(0, WS_VAD_SILENCE_TIMEOUT_MS - state.wsProgress.silenceMs);
+      if (state.wsProgress.silenceMs >= WS_VAD_SILENCE_TIMEOUT_MS) {
+        stopWebSocketSession("silence_timeout_60s", "连续静音 60 秒，已自动结束业务会话");
+        return;
+      }
+      if (now - state.wsLastVadUiUpdate >= 1000) {
+        state.wsLastVadUiUpdate = now;
+        setWsHeadline(
+          "in_session",
+          "业务会话进行中",
+          `当前静音 ${(state.wsProgress.silenceMs / 1000).toFixed(0)} 秒，距离自动结束还剩 ${(remainingMs / 1000).toFixed(0)} 秒。`
+        );
+        renderWsProgress();
+      }
+    }
+    state.wsVadFrameId = requestAnimationFrame(loop);
+  };
+  state.wsVadFrameId = requestAnimationFrame(loop);
 }
 
 function updateWindow(windowIndex, updates = {}) {
@@ -135,11 +334,37 @@ function updateWsProgressFromPayload(payload) {
       connected: true,
       streamSessionId: payload.streamSessionId || null,
       streamOpenedAt: new Date().toISOString(),
-      phase: "streaming",
-      headline: "流会话已建立，正在采集音频",
-      detail: `会话 ${shortId(payload.streamSessionId)} 已启动，等待首个 30 秒窗口完成。`
+      listeningStartedAt: payload.listeningStartedAt || new Date().toISOString(),
+      sessionState: payload.sessionState || "listening",
+      phase: "listening",
+      headline: "流会话已建立，正在监听连续人声",
+      detail: `连接 ${shortId(payload.streamSessionId)} 已建立，检测到连续人声后才会开始业务会话。`
     });
-    addWsEvent("会话建立", `Session ${shortId(payload.streamSessionId)}`);
+    addWsEvent("连接已建立", `Session ${shortId(payload.streamSessionId)}`);
+    return;
+  }
+
+  if (payload.type === "session_started") {
+    state.wsProgress.sessionStartedAt = payload.sessionStartedAt || new Date().toISOString();
+    state.wsProgress.sessionState = payload.sessionState || "in_session";
+    state.wsProgress.sessionStartRequested = false;
+    state.wsProgress.silenceMs = 0;
+    state.wsSilenceSince = null;
+    startWsRecorder();
+    setWsHeadline(
+      "in_session",
+      "检测到连续人声，业务会话已开始",
+      `会话开始时间 ${formatTime(state.wsProgress.sessionStartedAt)}，现在开始发送音频片段。`
+    );
+    addWsEvent("会话开始", `Session ${shortId(payload.streamSessionId)}`);
+    return;
+  }
+
+  if (payload.type === "listening_stopped") {
+    state.wsProgress.connected = false;
+    state.wsProgress.sessionState = payload.sessionState || "closed";
+    setWsHeadline("idle", "监听已结束，未进入业务会话", "本次仅建立了连接和监听态，没有触发会话开始。");
+    addWsEvent("结束监听", `Session ${shortId(payload.streamSessionId)}`);
     return;
   }
 
@@ -148,11 +373,28 @@ function updateWsProgressFromPayload(payload) {
     state.wsProgress.totalBytes = Number(payload.bytes || 0);
     if (!state.wsProgress.stopRequested) {
       setWsHeadline(
-        state.wsProgress.queuedWindows > 0 ? "streaming" : "capturing",
-        `持续接收音频片段 · ${state.wsProgress.chunkCount} 个 chunk`,
+        state.wsProgress.queuedWindows > 0 ? "streaming" : "in_session",
+        `业务会话进行中 · ${state.wsProgress.chunkCount} 个 chunk`,
         `累计 ${formatBytes(state.wsProgress.totalBytes)}，当前窗口写入中。`
       );
     }
+    return;
+  }
+
+  if (payload.type === "incremental_transcript") {
+    state.wsProgress.transcripts = [{
+      sequence: Number(payload.sequence || 0),
+      transcript: payload.transcript || "",
+      stability: Number(payload.stability || 0),
+      isFinal: Boolean(payload.isFinal),
+      time: new Date().toISOString()
+    }, ...(state.wsProgress.transcripts || [])].slice(0, 6);
+    addWsEvent("增量转写", `#${payload.sequence || state.wsProgress.transcripts.length}`);
+    return;
+  }
+
+  if (payload.type === "transcript_error") {
+    addWsEvent("转写暂不可用", payload.message || "model service unavailable");
     return;
   }
 
@@ -179,14 +421,16 @@ function updateWsProgressFromPayload(payload) {
 
   if (payload.type === "processing_started") {
     state.wsProgress.stopRequested = true;
+    state.wsProgress.sessionState = payload.sessionState || "post_processing";
+    state.wsProgress.closeReason = payload.closeReason || state.wsProgress.closeReason;
     state.wsProgress.lastAudioEventId = payload.audioEventId || state.wsProgress.lastAudioEventId;
     state.wsProgress.pendingWindows = Number(payload.pendingWindows || state.wsProgress.pendingWindows);
     setWsHeadline(
       "draining",
-      "已停止采集，等待后台处理剩余窗口",
+      "业务会话已结束，进入后处理阶段",
       `当前还有 ${state.wsProgress.pendingWindows} 个窗口排队或处理中。`
     );
-    addWsEvent("停止采集", `等待 ${state.wsProgress.pendingWindows} 个窗口完成`);
+    addWsEvent("进入后处理", `等待 ${state.wsProgress.pendingWindows} 个窗口完成`);
     return;
   }
 
@@ -217,13 +461,15 @@ function updateWsProgressFromPayload(payload) {
   if (payload.type === "processing_completed") {
     state.wsProgress.connected = false;
     state.wsProgress.stopRequested = true;
+    state.wsProgress.sessionState = payload.sessionState || "closed";
+    state.wsProgress.closeReason = payload.closeReason || state.wsProgress.closeReason;
     state.wsProgress.pendingWindows = 0;
     state.wsProgress.lastAudioEventId = payload.audioEventId || state.wsProgress.lastAudioEventId;
     state.wsProgress.lastConversationMemoryId = payload.conversationMemoryId || state.wsProgress.lastConversationMemoryId;
     state.wsProgress.lastProcessingStatus = payload.processingStatus || state.wsProgress.lastProcessingStatus;
     setWsHeadline(
       payload.processingStatus === "failed" ? "error" : "completed",
-      payload.processingStatus === "failed" ? "流式处理失败" : "所有窗口处理完成",
+      payload.processingStatus === "failed" ? "流式处理失败" : "业务会话与后处理均已完成",
       payload.conversationMemoryId
         ? `最新会话记录 ${shortId(payload.conversationMemoryId)} 已写入。`
         : "可在下方数据视图中查看最新流会话与窗口记录。"
@@ -278,6 +524,18 @@ function renderWsProgress() {
           <div>${escapeHtml(item.detail || "")}</div>
         </div>
       </li>
+    `).join("");
+  const silenceSeconds = Math.round((progress.silenceMs || 0) / 1000);
+  const silenceLimitSeconds = Math.round((progress.silenceTimeoutMs || WS_VAD_SILENCE_TIMEOUT_MS) / 1000);
+  const silenceRate = Math.min(100, Math.round((progress.silenceMs || 0) / (progress.silenceTimeoutMs || WS_VAD_SILENCE_TIMEOUT_MS) * 100));
+  const transcripts = (progress.transcripts || []).map(item => `
+      <article class="stream-transcript">
+        <div class="stream-window-top">
+          <strong>#${escapeHtml(item.sequence || "--")}</strong>
+          <span>${Math.round((item.stability || 0) * 100)}%</span>
+        </div>
+        <p>${escapeHtml(item.transcript || "")}</p>
+      </article>
     `).join("");
   const windows = (progress.windows || []).map(window => {
     const statusLabel = window.status === "completed"
@@ -373,11 +631,25 @@ function renderWsProgress() {
         <span>${escapeHtml(progress.lastProcessingStatus || "等待分析")}</span>
       </div>
       <div class="stream-stat">
+        <span>静音计时</span>
+        <strong>${silenceSeconds}s</strong>
+        <div class="stream-bar pending"><span style="width:${silenceRate}%"></span></div>
+      </div>
+      <div class="stream-stat">
         <span>流状态</span>
         <strong>${escapeHtml(progress.connected ? "OPEN" : "CLOSED")}</strong>
-        <span>${progress.streamOpenedAt ? formatTime(progress.streamOpenedAt) : "未开始"}</span>
+        <span>${progress.closeReason ? escapeHtml(progress.closeReason) : `${silenceLimitSeconds}s 静音阈值`}</span>
       </div>
     </div>
+    <section class="stream-transcripts">
+      <div class="stream-windows-head">
+        <strong>增量转写</strong>
+        <span>${(progress.transcripts || []).length} 条</span>
+      </div>
+      <div class="stream-transcript-grid">
+        ${transcripts || `<div class="stream-hint">业务会话开始后展示模型返回的实时片段。</div>`}
+      </div>
+    </section>
     <section class="stream-windows">
       <div class="stream-windows-head">
         <strong>最近窗口</strong>
@@ -543,6 +815,9 @@ function renderTimeline() {
     timeline.innerHTML = `<div class="event"><h3>暂无时间线</h3><p>上传录音、录入健康事件或发送 Agent 消息后，这里会展示结构化记录。</p></div>`;
     return;
   }
+  const correctionToolbar = conversations.length >= 2
+    ? `<div class="timeline-actions"><button onclick="mergeRecentConversations()">合并最近两条</button></div>`
+    : "";
   const conversationHtml = conversations.map(item => {
     const relatedSegments = segments.filter(segment => segment.audioEventId === item.sourceAudioEventId).slice(0, 4);
     return `<article class="event">
@@ -554,6 +829,10 @@ function renderTimeline() {
       <h3>${escapeHtml(item.title || "未命名会话")}</h3>
       <p>${escapeHtml(item.overview || "")}</p>
       ${relatedSegments.map(segment => `<p><strong>${escapeHtml(segment.displayName || "Unknown")}</strong>：${escapeHtml(segment.transcript || "")}</p>`).join("")}
+      <div class="timeline-actions">
+        <button onclick="reprocessConversation('${item.id}')">重算</button>
+        <button onclick="splitConversation('${item.id}')">拆分</button>
+      </div>
     </article>`;
   }).join("");
   const healthHtml = health.slice(0, 6).map(item => `<article class="event">
@@ -561,7 +840,7 @@ function renderTimeline() {
       <h3>${escapeHtml(item.eventType)}</h3>
       <p>${escapeHtml(displayHealthValue(item))}</p>
     </article>`).join("");
-  timeline.innerHTML = conversationHtml + healthHtml;
+  timeline.innerHTML = correctionToolbar + conversationHtml + healthHtml;
 }
 
 function renderSpeakers() {
@@ -705,7 +984,7 @@ async function startWebSocketStream() {
   resetWsProgress({
     phase: "connecting",
     headline: "正在连接 WebSocket 流会话",
-    detail: "建立连接后会自动开始发送 1 秒音频片段。"
+    detail: "建立连接后先进入本地监听态，检测到连续人声后才开始业务会话。"
   });
   state.wsStream = await navigator.mediaDevices.getUserMedia({ audio: true });
 
@@ -713,16 +992,11 @@ async function startWebSocketStream() {
   state.ws = new WebSocket(`${protocol}://${window.location.host}/ws/audio?userId=${encodeURIComponent(userId())}`);
   state.ws.binaryType = "arraybuffer";
   state.ws.onopen = () => {
-    $("wsStatus").textContent = "WebSocket 已连接，开始发送音频片段";
+    $("wsStatus").textContent = "WebSocket 已连接，正在监听连续人声";
     state.wsProgress.connected = true;
+    state.wsProgress.sessionState = "listening";
     renderWsProgress();
-    state.wsRecorder = new MediaRecorder(state.wsStream);
-    state.wsRecorder.ondataavailable = async event => {
-      if (event.data.size > 0 && state.ws?.readyState === WebSocket.OPEN) {
-        state.ws.send(await event.data.arrayBuffer());
-      }
-    };
-    state.wsRecorder.start(1000);
+    startWsVadLoop();
     $("wsStartBtn").disabled = true;
     $("wsStopBtn").disabled = false;
   };
@@ -755,22 +1029,12 @@ async function startWebSocketStream() {
       );
     }
     renderWsProgress();
-    state.wsStream?.getTracks().forEach(track => track.stop());
+    cleanupWsMedia();
   };
 }
 
 function stopWebSocketStream() {
-  if (state.wsRecorder && state.wsRecorder.state !== "inactive") {
-    state.wsRecorder.stop();
-  }
-  if (state.ws?.readyState === WebSocket.OPEN) {
-    state.ws.send(JSON.stringify({ type: "stop", fileName: "browser-stream.webm" }));
-    $("wsStatus").textContent = "已发送停止信号，等待处理";
-    state.wsProgress.stopRequested = true;
-    setWsHeadline("draining", "停止信号已发送", "前端不再继续采集，后台正在处理剩余窗口。");
-    addWsEvent("停止请求", "已发送 stop 控制消息");
-    renderWsProgress();
-  }
+  stopWebSocketSession("manual_stop", "已手动强制结束当前业务会话");
 }
 
 async function labelSpeaker(event, speakerId) {
@@ -795,6 +1059,44 @@ async function acceptMemory(id) {
 async function rejectMemory(id) {
   await api(`/api/demo/memory-candidates/${id}/reject`, { method: "POST" });
   toast("候选记忆已拒绝");
+  await refresh();
+}
+
+async function mergeRecentConversations() {
+  const ids = (state.data?.conversationMemories || [])
+    .filter(item => !item.discarded)
+    .slice(0, 2)
+    .map(item => item.id);
+  if (ids.length < 2) {
+    toast("至少需要两条会话记录");
+    return;
+  }
+  await api("/api/conversations/merge", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ userId: userId(), conversationMemoryIds: ids, reason: "demo_manual_merge" })
+  });
+  toast("最近两条会话已合并");
+  await refresh();
+}
+
+async function splitConversation(id) {
+  await api(`/api/conversations/${id}/split`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ userId: userId(), reason: "demo_manual_split" })
+  });
+  toast("会话已拆分");
+  await refresh();
+}
+
+async function reprocessConversation(id) {
+  await api(`/api/conversations/${id}/reprocess`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ userId: userId(), reason: "demo_manual_reprocess" })
+  });
+  toast("会话已重算");
   await refresh();
 }
 
@@ -837,6 +1139,8 @@ function progressPhaseLabel(progress) {
   if (progress.phase === "processed") return "处理中收尾";
   if (progress.phase === "draining") return "等待排空";
   if (progress.phase === "processing") return "窗口分析中";
+  if (progress.phase === "in_session") return "会话中";
+  if (progress.phase === "listening") return "监听中";
   if (progress.phase === "capturing") return "采集中";
   if (progress.phase === "streaming") return "流会话已开启";
   if (progress.phase === "connecting") return "连接中";
@@ -906,7 +1210,7 @@ $("healthForm").addEventListener("submit", async event => {
     source: "manual"
   };
   try {
-    await api("/api/demo/health", {
+    await api("/api/health/events", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(payload)
@@ -923,7 +1227,7 @@ $("agentForm").addEventListener("submit", async event => {
   const content = $("agentMessage").value.trim();
   if (!content) return;
   try {
-    const result = await api("/api/demo/agent/messages", {
+    const result = await api("/api/agent/messages", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ userId: userId(), conversationSessionId: state.sessionId, content })

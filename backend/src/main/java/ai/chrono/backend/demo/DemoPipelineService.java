@@ -1,7 +1,10 @@
 package ai.chrono.backend.demo;
 
 import ai.chrono.backend.audio.AudioStorage;
+import ai.chrono.backend.health.HealthEventRequest;
+import ai.chrono.backend.health.HealthEventResponse;
 import ai.chrono.backend.health.HealthEventTypes;
+import ai.chrono.backend.health.HealthService;
 import ai.chrono.backend.memory.MemoryCandidateDecisionService;
 import ai.chrono.backend.modelclient.ModelServiceClient;
 import ai.chrono.backend.modelclient.dto.AgentReplyRequest;
@@ -58,6 +61,7 @@ public class DemoPipelineService {
     private final AudioStorage audioStorage;
     private final ModelServiceClient modelServiceClient;
     private final ModelJobService modelJobService;
+    private final HealthService healthService;
     private final MemoryCandidateDecisionService memoryDecisionService;
     private final SpeakerLabelSuggestionService labelSuggestionService;
     private final PersonInsightService personInsightService;
@@ -67,6 +71,7 @@ public class DemoPipelineService {
             AudioStorage audioStorage,
             ModelServiceClient modelServiceClient,
             ModelJobService modelJobService,
+            HealthService healthService,
             MemoryCandidateDecisionService memoryDecisionService,
             SpeakerLabelSuggestionService labelSuggestionService,
             PersonInsightService personInsightService
@@ -75,6 +80,7 @@ public class DemoPipelineService {
         this.audioStorage = audioStorage;
         this.modelServiceClient = modelServiceClient;
         this.modelJobService = modelJobService;
+        this.healthService = healthService;
         this.memoryDecisionService = memoryDecisionService;
         this.labelSuggestionService = labelSuggestionService;
         this.personInsightService = personInsightService;
@@ -133,7 +139,7 @@ public class DemoPipelineService {
     @Transactional
     public DemoAudioResult processPendingAudio(UUID audioEventId) {
         Map<String, Object> audioEvent = jdbc.queryForMap("""
-                select user_id, audio_uri, started_at, ended_at
+                select user_id, audio_uri, started_at, ended_at, stream_session_id, window_index
                 from audio_event
                 where id = ?
                 """, audioEventId);
@@ -141,6 +147,7 @@ public class DemoPipelineService {
         String audioUri = String.valueOf(audioEvent.get("audio_uri"));
         Instant startedAt = timestampValue(audioEvent.get("started_at"), Instant.now());
         Instant endedAt = timestampValue(audioEvent.get("ended_at"), startedAt);
+        UUID streamSessionId = parseUuid(String.valueOf(audioEvent.get("stream_session_id")));
         UUID modelJobId = jdbc.queryForObject("""
                 select id
                 from model_job
@@ -180,9 +187,32 @@ public class DemoPipelineService {
 
         boolean discarded = Boolean.TRUE.equals(response.summary().discard());
         String processingStatus = discarded ? "discarded" : "completed";
-        UUID conversationMemoryId = UUID.randomUUID();
         Instant now = Instant.now();
         List<Map<String, Object>> speakerRefs = persistSpeakerData(userId, audioEventId, response, now);
+
+        if (streamSessionId != null) {
+            jdbc.update("update model_job set status = ?, response_ref = ?, updated_at = ? where id = ?",
+                    "completed", "audio_window://" + audioEventId, Timestamp.from(now), modelJobId);
+            jdbc.update("update audio_event set processing_status = ?, updated_at = ? where id = ?",
+                    processingStatus, Timestamp.from(now), audioEventId);
+            audit(userId, "audio.window_processed", "audio_event", audioEventId, Map.of(
+                    "streamSessionId", streamSessionId.toString(),
+                    "windowIndex", String.valueOf(audioEvent.get("window_index"))
+            ));
+            return new DemoAudioResult(
+                    audioEventId.toString(),
+                    modelJobId.toString(),
+                    null,
+                    processingStatus,
+                    response.summary().title(),
+                    response.summary().overview(),
+                    rows("select id, speaker_id, speaker_cluster_id, start_ms, end_ms, transcript, confidence, emotion_tags, topic_tags from speaker_segment where audio_event_id = ? order by start_ms", audioEventId),
+                    rows("select id, display_name, status, user_labeled, first_seen_at, last_seen_at, label_suggestion from speaker_cluster where user_id = ? and deleted_at is null order by last_seen_at desc", userId),
+                    List.of()
+            );
+        }
+
+        UUID conversationMemoryId = UUID.randomUUID();
 
         jdbc.update("""
                         insert into conversation_memory (
@@ -230,6 +260,114 @@ public class DemoPipelineService {
         );
     }
 
+    @Transactional
+    public DemoAudioResult processStreamSession(UUID streamSessionId, String closeReason) {
+        Map<String, Object> session = jdbc.queryForMap("""
+                select user_id, started_at, session_started_at, closed_at
+                from audio_stream_session
+                where id = ?
+                """, streamSessionId);
+        String userId = String.valueOf(session.get("user_id"));
+        Instant now = Instant.now();
+        Instant startedAt = timestampValue(session.get("session_started_at"), timestampValue(session.get("started_at"), now));
+        Instant endedAt = timestampValue(session.get("closed_at"), now);
+        List<Map<String, Object>> audioEvents = rows("""
+                select id, window_index, processing_status, started_at, ended_at
+                from audio_event
+                where stream_session_id = ?
+                order by window_index nulls last, created_at
+                """, streamSessionId);
+        if (audioEvents.isEmpty()) {
+            throw new IllegalStateException("stream session has no audio windows");
+        }
+        List<Map<String, Object>> segments = rows("""
+                select ss.id, ss.audio_event_id, ss.speaker_cluster_id, sc.display_name, ss.speaker_id,
+                       ss.start_ms, ss.end_ms, ss.transcript, ss.confidence, ss.emotion_tags, ss.topic_tags
+                from speaker_segment ss
+                join audio_event ae on ae.id = ss.audio_event_id
+                left join speaker_cluster sc on sc.id = ss.speaker_cluster_id
+                where ae.stream_session_id = ?
+                order by ae.window_index nulls last, ss.start_ms
+                """, streamSessionId);
+        String transcript = combinedTranscript(segments);
+        boolean discarded = transcript.isBlank();
+        String title = discarded ? "低价值流式会话" : "流式会话复盘";
+        String overview = discarded
+                ? "本次流式会话没有形成可用转写。"
+                : summarizeTranscript(transcript);
+        UUID conversationMemoryId = UUID.randomUUID();
+        UUID sourceAudioEventId = parseUuid(String.valueOf(audioEvents.get(0).get("id")));
+        List<Map<String, Object>> speakerRefs = segments.stream()
+                .map(segment -> linkedMap(
+                        "speakerClusterId", segment.get("speakerClusterId"),
+                        "speakerSegmentId", segment.get("id"),
+                        "audioEventId", segment.get("audioEventId"),
+                        "speakerId", segment.get("speakerId"),
+                        "startMs", segment.get("startMs"),
+                        "endMs", segment.get("endMs")
+                ))
+                .toList();
+        List<Map<String, Object>> evidenceRefs = audioEvents.stream()
+                .map(event -> linkedMap(
+                        "type", "audio_event",
+                        "id", event.get("id"),
+                        "windowIndex", event.get("windowIndex"),
+                        "processingStatus", event.get("processingStatus")
+                ))
+                .toList();
+
+        jdbc.update("""
+                        insert into conversation_memory (
+                            id, user_id, source_type, source_audio_event_id, source_stream_session_id, started_at, ended_at,
+                            title, overview, language, category, status, post_processing_status, processing_attempts,
+                            discarded, discard_reason, visibility, transcript_ref, speaker_refs, health_refs, topic_tags,
+                            emotion_tags, suggested_actions, suggested_events, evidence_refs, created_at, updated_at
+                        ) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, %s, %s, %s, %s, %s, %s, %s, ?, ?)
+                        """.formatted(JSONB, JSONB, JSONB, JSONB, JSONB, JSONB, JSONB),
+                conversationMemoryId, userId, "audio_session", sourceAudioEventId, streamSessionId,
+                Timestamp.from(startedAt), Timestamp.from(endedAt), title, overview, "zh", "life_log",
+                discarded ? "discarded" : "completed", "completed", 1, discarded,
+                discarded ? "blank_or_low_value_stream_session" : null, "private",
+                "inline://audio-stream-session/" + streamSessionId + "/transcript",
+                json(speakerRefs), json(List.of()), json(List.of("stream_session")), json(List.of()),
+                json(List.of()), json(List.of()), json(evidenceRefs), Timestamp.from(now), Timestamp.from(now));
+
+        if (!discarded) {
+            persistMemoryCandidates(List.of(new AnalyzeAudioResponse.MemoryCandidateDto(
+                    "conversation_context",
+                    "用户完成了一次流式语音会话：" + trim(overview, 160),
+                    0.58,
+                    "normal"
+            )), null, conversationMemoryId, null, "session_post_processing");
+            persistPersonInsights(userId, speakerRefs, now);
+            tryIndexVectorDocument(userId, "conversation_memory", conversationMemoryId, title + "\n" + overview, "流式会话后处理形成的会话记录", now);
+        }
+
+        jdbc.update("""
+                        update audio_stream_session
+                        set session_conversation_memory_id = ?, session_post_processing_status = ?, session_status = ?, updated_at = ?
+                        where id = ?
+                        """,
+                conversationMemoryId, "completed", "closed", Timestamp.from(now), streamSessionId);
+        audit(userId, "audio_stream_session.post_processed", "audio_stream_session", streamSessionId, Map.of(
+                "conversationMemoryId", conversationMemoryId.toString(),
+                "closeReason", closeReason == null ? "" : closeReason,
+                "windowCount", audioEvents.size()
+        ));
+
+        return new DemoAudioResult(
+                sourceAudioEventId == null ? null : sourceAudioEventId.toString(),
+                null,
+                conversationMemoryId.toString(),
+                discarded ? "discarded" : "completed",
+                title,
+                overview,
+                segments,
+                rows("select id, display_name, status, user_labeled, first_seen_at, last_seen_at, label_suggestion from speaker_cluster where user_id = ? and deleted_at is null order by last_seen_at desc", userId),
+                rows("select id, memory_type, content, confidence, decision, created_at from memory_write_candidate where conversation_memory_id = ? order by created_at desc", conversationMemoryId)
+        );
+    }
+
     @Transactional(readOnly = true)
     public DemoStateResponse getState(String userId) {
         return new DemoStateResponse(
@@ -242,14 +380,16 @@ public class DemoPipelineService {
                         order by created_at desc limit 20
                         """, userId),
                 rows("""
-                        select id, source_type, status, started_at, last_active_at, closed_at, close_reason,
-                               current_audio_event_id, window_count, processed_window_count, failed_window_count, created_at, updated_at
+                        select id, source_type, status, session_status, started_at, session_started_at, session_ended_at,
+                               last_active_at, closed_at, close_reason, session_close_reason, session_conversation_memory_id,
+                               session_post_processing_status, current_audio_event_id, window_count, processed_window_count,
+                               failed_window_count, created_at, updated_at
                         from audio_stream_session
                         where user_id = ?
                         order by created_at desc limit 20
                         """, userId),
                 rows("select id, event_type, measured_at, value_numeric, value_text, unit, source, created_at from health_event where user_id = ? order by measured_at desc limit 30", userId),
-                rows("select id, source_type, source_audio_event_id, started_at, title, overview, status, discarded, discard_reason, topic_tags, emotion_tags, created_at from conversation_memory where user_id = ? and deleted_at is null order by created_at desc limit 20", userId),
+                rows("select id, source_type, source_audio_event_id, source_stream_session_id, started_at, title, overview, status, discarded, discard_reason, topic_tags, emotion_tags, evidence_refs, created_at from conversation_memory where user_id = ? and deleted_at is null order by created_at desc limit 20", userId),
                 rows("select id, display_name, status, user_labeled, label_suggestion, first_seen_at, last_seen_at, match_confidence_summary from speaker_cluster where user_id = ? and deleted_at is null order by last_seen_at desc limit 20", userId),
                 rows("""
                         select ss.id, ss.audio_event_id, ss.speaker_cluster_id, sc.display_name, ss.start_ms, ss.end_ms, ss.transcript, ss.confidence, ss.emotion_tags, ss.topic_tags
@@ -300,17 +440,29 @@ public class DemoPipelineService {
         if (!HealthEventTypes.isAllowed(request.eventType())) {
             throw new IllegalArgumentException("unsupported health event type");
         }
-        UUID id = UUID.randomUUID();
-        Instant now = Instant.now();
-        jdbc.update("""
-                        insert into health_event (
-                            id, user_id, event_type, measured_at, value_numeric, value_text, unit, source, metadata, created_at
-                        ) values (?, ?, ?, ?, ?, ?, ?, ?, %s, ?)
-                        """.formatted(JSONB),
-                id, request.userId(), request.eventType(), Timestamp.from(request.measuredAt()), request.valueNumeric(),
-                request.valueText(), request.unit(), blankToDefault(request.source(), "manual"), json(Map.of("demo", true)), Timestamp.from(now));
-        audit(request.userId(), "health_event.created", "health_event", id, Map.of("eventType", request.eventType()));
-        return row("select id, event_type, measured_at, value_numeric, value_text, unit, source, created_at from health_event where id = ?", id);
+        HealthEventResponse response = healthService.create(new HealthEventRequest(
+                request.userId(),
+                request.eventType(),
+                request.measuredAt(),
+                request.valueNumeric(),
+                request.valueText(),
+                request.unit(),
+                request.source()
+        ));
+        UUID healthEventId = UUID.fromString(response.id());
+        audit(request.userId(), "health_event.created", "health_event", healthEventId, Map.of("eventType", request.eventType()));
+        return linkedMap(
+                "id", response.id(),
+                "userId", response.userId(),
+                "eventType", response.eventType(),
+                "measuredAt", response.measuredAt(),
+                "valueNumeric", response.valueNumeric(),
+                "valueText", response.valueText(),
+                "unit", response.unit(),
+                "source", response.source(),
+                "displayValue", response.displayValue(),
+                "createdAt", response.createdAt()
+        );
     }
 
     @Transactional
@@ -667,15 +819,25 @@ public class DemoPipelineService {
         );
     }
 
-    private String healthText(Map<String, Object> row) {
-        Object value = row.get("valueText") != null ? row.get("valueText") : row.get("valueNumeric");
-        Object unit = row.get("unit") == null ? "" : row.get("unit");
-        return row.get("eventType") + ": " + value + unit;
+    private String combinedTranscript(List<Map<String, Object>> segments) {
+        List<String> lines = new ArrayList<>();
+        for (Map<String, Object> segment : segments) {
+            String transcript = String.valueOf(segment.getOrDefault("transcript", "")).trim();
+            if (transcript.isBlank()) {
+                continue;
+            }
+            String displayName = String.valueOf(segment.getOrDefault("displayName", "Unknown Person")).trim();
+            lines.add(displayName + ": " + transcript);
+        }
+        return String.join("\n", lines);
     }
 
-    private String displayHealthValue(String valueText, Number valueNumeric, String unit) {
-        Object value = valueText != null && !valueText.isBlank() ? valueText : valueNumeric;
-        return String.valueOf(value == null ? "" : value) + (unit == null ? "" : unit);
+    private String summarizeTranscript(String transcript) {
+        String compact = transcript.replaceAll("\\s+", " ").trim();
+        if (compact.length() <= 240) {
+            return "本次流式会话主要内容：" + compact;
+        }
+        return "本次流式会话主要内容：" + compact.substring(0, 240) + "...";
     }
 
     private UUID parseUuid(String value) {

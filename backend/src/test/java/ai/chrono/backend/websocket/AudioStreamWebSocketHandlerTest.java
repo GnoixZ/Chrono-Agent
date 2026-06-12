@@ -2,6 +2,9 @@ package ai.chrono.backend.websocket;
 
 import ai.chrono.backend.demo.DemoAudioResult;
 import ai.chrono.backend.demo.DemoPipelineService;
+import ai.chrono.backend.modelclient.ModelServiceClient;
+import ai.chrono.backend.modelclient.dto.IncrementalTranscriptRequest;
+import ai.chrono.backend.modelclient.dto.IncrementalTranscriptResponse;
 import ai.chrono.backend.task.AudioAnalyzeTaskService;
 import org.junit.jupiter.api.Test;
 import org.springframework.jdbc.core.JdbcTemplate;
@@ -40,6 +43,7 @@ class AudioStreamWebSocketHandlerTest {
         fixture.pipelineResults.put(fixture.audioEventIds.get(1), completedResult(fixture.audioEventIds.get(1), "memory-2"));
 
         fixture.handler.afterConnectionEstablished(fixture.session);
+        fixture.handler.handleTextMessage(fixture.session, new TextMessage("{\"type\":\"session_started\"}"));
         fixture.handler.handleBinaryMessage(fixture.session, new BinaryMessage(chunk()));
         fixture.setCurrentWindowStartedAtSecondsAgo(31);
         fixture.handler.handleBinaryMessage(fixture.session, new BinaryMessage(chunk()));
@@ -54,10 +58,12 @@ class AudioStreamWebSocketHandlerTest {
         assertThat(fixture.fileNames).containsExactly("browser-stream.part-001.webm", "long-run.final-002.webm");
         assertThat(fixture.outboundMessages.stream().filter(message -> message.contains("\"type\":\"window_processing_started\"")).count()).isEqualTo(2);
         assertThat(fixture.outboundMessages.stream().filter(message -> message.contains("\"type\":\"window_processing_completed\"")).count()).isEqualTo(2);
+        assertThat(fixture.outboundMessages.stream().filter(message -> message.contains("\"type\":\"incremental_transcript\"")).count()).isEqualTo(3);
         assertThat(fixture.outboundMessages.stream().anyMatch(message -> message.contains("\"type\":\"processing_completed\""))).isTrue();
-        assertThat(fixture.closeReasons()).contains("client_stop");
+        assertThat(fixture.closeReasons()).contains("manual_stop");
 
         verify(fixture.audioAnalyzeTaskService, times(2)).submitAudioAnalyzeJob(any(UUID.class));
+        verify(fixture.audioAnalyzeTaskService).submitSessionPostProcessingJob(any(UUID.class), anyString());
     }
 
     @Test
@@ -66,6 +72,7 @@ class AudioStreamWebSocketHandlerTest {
         fixture.pipelineResults.put(fixture.audioEventIds.get(0), completedResult(fixture.audioEventIds.get(0), "memory-disconnect"));
 
         fixture.handler.afterConnectionEstablished(fixture.session);
+        fixture.handler.handleTextMessage(fixture.session, new TextMessage("{\"type\":\"session_started\"}"));
         fixture.handler.handleBinaryMessage(fixture.session, new BinaryMessage(chunk()));
         fixture.setCurrentWindowStartedAtSecondsAgo(4);
         fixture.handler.afterConnectionClosed(fixture.session, new CloseStatus(1001, "network_lost"));
@@ -85,6 +92,7 @@ class AudioStreamWebSocketHandlerTest {
         TestFixture fixture = new TestFixture();
 
         fixture.handler.afterConnectionEstablished(fixture.session);
+        fixture.handler.handleTextMessage(fixture.session, new TextMessage("{\"type\":\"session_started\"}"));
         fixture.handler.handleBinaryMessage(fixture.session, new BinaryMessage(chunk()));
         fixture.handler.afterConnectionClosed(fixture.session, new CloseStatus(1001, "network_lost"));
 
@@ -93,6 +101,33 @@ class AudioStreamWebSocketHandlerTest {
         assertThat(fixture.sqlStatements()).noneMatch(sql -> sql.contains("window_count = window_count + 1"));
 
         verifyNoInteractions(fixture.audioAnalyzeTaskService);
+    }
+
+    @Test
+    void binaryChunkBeforeSessionStartIsRejected() throws Exception {
+        TestFixture fixture = new TestFixture();
+
+        fixture.handler.afterConnectionEstablished(fixture.session);
+        fixture.handler.handleBinaryMessage(fixture.session, new BinaryMessage(chunk()));
+
+        assertThat(fixture.outboundMessages).anyMatch(message -> message.contains("session is not started"));
+        assertThat(fixture.windowMetadata).isEmpty();
+        verifyNoInteractions(fixture.audioAnalyzeTaskService);
+    }
+
+    @Test
+    void automaticSilenceStopPersistsCloseReason() throws Exception {
+        TestFixture fixture = new TestFixture();
+        fixture.pipelineResults.put(fixture.audioEventIds.get(0), completedResult(fixture.audioEventIds.get(0), null));
+
+        fixture.handler.afterConnectionEstablished(fixture.session);
+        fixture.handler.handleTextMessage(fixture.session, new TextMessage("{\"type\":\"session_started\"}"));
+        fixture.handler.handleBinaryMessage(fixture.session, new BinaryMessage(chunk()));
+        fixture.handler.handleTextMessage(fixture.session, new TextMessage("{\"type\":\"stop\",\"reason\":\"silence_timeout_60s\"}"));
+
+        assertThat(fixture.closeReasons()).contains("silence_timeout_60s");
+        assertThat(fixture.outboundMessages).anyMatch(message ->
+                message.contains("\"type\":\"processing_completed\"") && message.contains("\"closeReason\":\"silence_timeout_60s\""));
     }
 
     private static DemoAudioResult completedResult(UUID audioEventId, String conversationMemoryId) {
@@ -121,7 +156,8 @@ class AudioStreamWebSocketHandlerTest {
         private final JdbcTemplate jdbc = mock(JdbcTemplate.class);
         private final DemoPipelineService demoPipelineService = mock(DemoPipelineService.class);
         private final AudioAnalyzeTaskService audioAnalyzeTaskService = mock(AudioAnalyzeTaskService.class);
-        private final AudioStreamWebSocketHandler handler = new AudioStreamWebSocketHandler(jdbc, demoPipelineService, audioAnalyzeTaskService);
+        private final ModelServiceClient modelServiceClient = mock(ModelServiceClient.class);
+        private final AudioStreamWebSocketHandler handler = new AudioStreamWebSocketHandler(jdbc, demoPipelineService, audioAnalyzeTaskService, modelServiceClient);
         private final WebSocketSession session = mock(WebSocketSession.class);
         private final List<String> outboundMessages = new ArrayList<>();
         private final List<DemoPipelineService.AudioWindowMetadata> windowMetadata = new ArrayList<>();
@@ -154,6 +190,29 @@ class AudioStreamWebSocketHandlerTest {
                         return CompletableFuture.failedFuture(new IllegalStateException("missing result for " + audioEventId));
                     }
                     return CompletableFuture.completedFuture(result);
+                });
+                when(audioAnalyzeTaskService.submitSessionPostProcessingJob(any(UUID.class), anyString())).thenReturn(CompletableFuture.completedFuture(
+                        new DemoAudioResult(
+                                audioEventIds.get(0).toString(),
+                                null,
+                                "session-memory",
+                                "completed",
+                                "session title",
+                                "session overview",
+                                List.of(),
+                                List.of(),
+                                List.of()
+                        )
+                ));
+                when(modelServiceClient.incrementalTranscript(any(IncrementalTranscriptRequest.class))).thenAnswer(invocation -> {
+                    IncrementalTranscriptRequest request = invocation.getArgument(0, IncrementalTranscriptRequest.class);
+                    return new IncrementalTranscriptResponse(
+                            request.streamSessionId(),
+                            request.chunkIndex(),
+                            "chunk " + request.chunkIndex(),
+                            0.72,
+                            false
+                    );
                 });
             } catch (Exception error) {
                 throw new IllegalStateException(error);

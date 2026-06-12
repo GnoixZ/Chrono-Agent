@@ -95,7 +95,7 @@ Demo 支持：
 
 - 上传录音文件并生成会话记录。
 - 浏览器麦克风录音后上传。
-- WebSocket 音频流 `/ws/audio?userId=demo-user`，浏览器按片段发送音频块，停止后合并处理。
+- WebSocket 音频流 `/ws/audio?userId=demo-user`，浏览器先进入监听态，本地检测到连续人声后发送 `session_started`，会话中按片段上传音频并展示增量转写，连续静音 60 秒或手动停止后进入会话级后处理。
 - 录入健康事件。
 - 展示已存储的音频、会话、转写、人物、洞察、候选记忆、长期记忆、Agent 消息、召回事件、模型任务和审计日志。
 - 标注匿名人物。
@@ -115,6 +115,7 @@ Demo 支持：
 - Agent 回复由 Python 调用 OpenRouter chat completions，当前默认模型为 NVIDIA Nemotron 3 Nano Omni。
 - 召回索引由 Python 调用 OpenRouter embeddings 生成文本向量，并写入/查询阿里云 DashVector。
 - WebSocket 使用 Spring WebSocket `WebSocketHandler` 注册 `/ws/audio`。
+- WebSocket 控制消息包括 `session_started`、`stop` 和 `close_listening`；`stop.reason` 会记录为 `manual_stop` 或 `silence_timeout_60s` 等关闭原因。
 - Demo 状态接口会把 PostgreSQL `jsonb` 字段转换成普通 JSON，方便前端“已存储用户数据”面板展示。
 
 ## MVP 验证

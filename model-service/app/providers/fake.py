@@ -2,6 +2,8 @@ from app.schemas import (
     AnalyzeAudioRequest,
     AnalyzeAudioResponse,
     ConversationSummary,
+    IncrementalTranscriptRequest,
+    IncrementalTranscriptResponse,
     MemoryCandidate,
     SafetyResult,
     SpeakerEmbedding,
@@ -11,6 +13,20 @@ from app.schemas import (
 
 
 class FakeModelProvider:
+    def incremental_transcript(self, request: IncrementalTranscriptRequest) -> IncrementalTranscriptResponse:
+        transcript = (
+            f"实时片段 {request.chunk_index}: 已接收约 {request.chunk_bytes} 字节音频。"
+            if not request.is_final
+            else f"实时片段 {request.chunk_index}: 最后一段音频已接收。"
+        )
+        return IncrementalTranscriptResponse(
+            stream_session_id=request.stream_session_id,
+            sequence=request.chunk_index,
+            transcript=transcript,
+            stability=0.72,
+            is_final=request.is_final,
+        )
+
     def analyze_audio(self, request: AnalyzeAudioRequest) -> AnalyzeAudioResponse:
         if "blank" in request.audio_uri:
             return AnalyzeAudioResponse(

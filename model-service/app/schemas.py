@@ -71,6 +71,23 @@ class AnalyzeAudioResponse(BaseModel):
     safety: SafetyResult
 
 
+class IncrementalTranscriptRequest(BaseModel):
+    request_id: str
+    user_id: str
+    stream_session_id: str
+    chunk_index: int
+    chunk_bytes: int
+    is_final: bool = False
+
+
+class IncrementalTranscriptResponse(BaseModel):
+    stream_session_id: str
+    sequence: int
+    transcript: str
+    stability: float
+    is_final: bool = False
+
+
 class AgentContextItem(BaseModel):
     source_type: str
     source_id: str

@@ -5,6 +5,11 @@ public record HealthEventResponse(
         String userId,
         String eventType,
         String measuredAt,
-        String displayValue
+        Double valueNumeric,
+        String valueText,
+        String unit,
+        String source,
+        String displayValue,
+        String createdAt
 ) {
 }

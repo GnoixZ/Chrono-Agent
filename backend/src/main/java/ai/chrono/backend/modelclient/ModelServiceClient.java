@@ -4,6 +4,8 @@ import ai.chrono.backend.modelclient.dto.AgentReplyRequest;
 import ai.chrono.backend.modelclient.dto.AgentReplyResponse;
 import ai.chrono.backend.modelclient.dto.AnalyzeAudioRequest;
 import ai.chrono.backend.modelclient.dto.AnalyzeAudioResponse;
+import ai.chrono.backend.modelclient.dto.IncrementalTranscriptRequest;
+import ai.chrono.backend.modelclient.dto.IncrementalTranscriptResponse;
 import ai.chrono.backend.modelclient.dto.VectorSearchRequest;
 import ai.chrono.backend.modelclient.dto.VectorSearchResponse;
 import ai.chrono.backend.modelclient.dto.VectorUpsertRequest;
@@ -34,6 +36,11 @@ public class ModelServiceClient {
     public AnalyzeAudioResponse analyzeAudio(AnalyzeAudioRequest request) {
         String response = postJson("/v1/audio/analyze", request);
         return readJson(response, AnalyzeAudioResponse.class);
+    }
+
+    public IncrementalTranscriptResponse incrementalTranscript(IncrementalTranscriptRequest request) {
+        String response = postJson("/v1/audio/transcript", request);
+        return readJson(response, IncrementalTranscriptResponse.class);
     }
 
     public AgentReplyResponse generateReply(AgentReplyRequest request) {

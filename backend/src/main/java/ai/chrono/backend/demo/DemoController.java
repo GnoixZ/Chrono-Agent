@@ -55,8 +55,4 @@ public class DemoController {
         return ResponseEntity.ok(demoPipelineService.rejectMemoryCandidate(candidateId));
     }
 
-    @PostMapping("/agent/messages")
-    ResponseEntity<DemoAgentMessageResponse> sendAgentMessage(@Valid @RequestBody DemoAgentMessageRequest request) {
-        return ResponseEntity.ok(demoPipelineService.sendAgentMessage(request));
-    }
 }
